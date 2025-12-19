@@ -3,30 +3,28 @@
 Script for volume registration and cell mapping using ClearMap2.
 Organized for clarity and maintainability.
 """
-#nohup python cellMap_fengyi2.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/fw2/log/registration.txt &
+#make sure input points are in pixel coordinates of the stitched image
+#if spatial coordinate, transform_points(indices=False)
+#nohup python cellMap_fengyi2.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/log/registration_.txt &
 import os
 import csv
 import shutil
 import numpy as np
-
-# ==== === Project/Experiment Parameters === ===
-# ----- File and Path Setting -----
-STITCHED_FILENAME = 'registration.tif'
-DATA_DIR = '/data/hdd12tb-1/fengyi/COMBINe/clearmap/fw2'
-CELL_CENTROIDS_DIR = os.path.join(DATA_DIR, 'cell_centroids')
-RESOURCES_DIR = None # will be set later by settings.resources_path
-
-# ===== Data-specific Parameters -----
-VOXEL_SIZE_ORIGINAL = np.array([0.65, 0.65, 20])      # detection resolution
-VOXEL_SIZE_STITCHED = np.array([5.2, 5.2, 20])        # stitched dataset (pre-reg)
-VOXEL_SIZE_RESAMPLED = np.array([25, 25, 25])         # resampled/atlas
-N_CLASSES = 6                                         # number of cell classes
-
-# ==== ==== ClearMap Modules ==== ====
 from ClearMap.Environment import *
 import numpy.lib.recfunctions as rfn
 
-# --- Derived params
+# ==== === Project/Experiment Parameters === ===
+STITCHED_FILENAME = 'registration.tif'
+DATA_DIR = '/data/hdd12tb-1/fengyi/COMBINe/clearmap/fw9'
+CELL_CENTROIDS_DIR = os.path.join(DATA_DIR, 'cell_centroids')
+RESOURCES_DIR = None # will be set later by settings.resources_path
+
+VOXEL_SIZE_ORIGINAL = np.array([0.65, 0.65, 10])      # raw data resolution
+VOXEL_SIZE_STITCHED = np.array([5.2, 5.2, 10])        # pixel size of registration.tif: compare the max resolution stitched images (0.65um pixel size) to the unknown stitched image 
+                                                        #normally the 5th resolution in terastitcher is 5.2um pixel size 
+VOXEL_SIZE_RESAMPLED = np.array([25, 25, 25])         # resampled/atlas
+N_CLASSES = 6                                         # number of cell classes
+
 ratio = VOXEL_SIZE_STITCHED / VOXEL_SIZE_ORIGINAL
 
 # ==== ==== Workspace Setup ==== ====
@@ -36,12 +34,40 @@ ws.debug = False
 RESOURCES_DIR = settings.resources_path
 ws.info()
 
+# ==== ==== Workspace Setup ==== ====
+ws = wsp.Workspace('CellMap', directory=DATA_DIR)
+ws.update(stitched=STITCHED_FILENAME)
+ws.debug = False
+RESOURCES_DIR = settings.resources_path
+ws.info()
+
+# --- 新增：打印自定义参数到日志 ---
+import sys
+
+print("\n" + "="*30)
+print("EXPERIMENT PARAMETERS LOG")
+print("="*30)
+print(f"Data Directory:         {DATA_DIR}")
+print(f"Stitched Filename:      {STITCHED_FILENAME}")
+print(f"Cell Centroids Dir:     {CELL_CENTROIDS_DIR}")
+print(f"Number of Cell Classes: {N_CLASSES}")
+print("-" * 30)
+print(f"Voxel Size Original:    {VOXEL_SIZE_ORIGINAL}")
+print(f"Voxel Size Stitched:    {VOXEL_SIZE_STITCHED}")
+print(f"Voxel Size Resampled:   {VOXEL_SIZE_RESAMPLED}")
+print(f"Calculated Ratio:       {ratio}")
+print("="*30 + "\n")
+
+# 强制刷新缓冲区，确保 nohup 性能实时查看到以上内容
+sys.stdout.flush()
+
 # ==== ==== Annotation & Reference Preparation ==== ====
+#output: ClearMap/Resources/Atlas/
 def prepare_annotation():
     """Adjust and prepare annotation/reference files."""
     annotation_file, vol_annotation_file, reference_file, distance_file = ano.prepare_annotation_files(
-        slicing=(slice(None),slice(None),slice(None)), orientation=(-3,-1,-2),
-        overwrite=False, verbose=True)
+        slicing=(slice(None),slice(None),slice(None)), orientation=(-3,-1,-2), #change the order of axes, reorient registration
+        overwrite=True, verbose=True)
     return annotation_file, vol_annotation_file, reference_file, distance_file
 
 (annotation_file, vol_annotation_file, 
@@ -53,11 +79,12 @@ align_channels_affine_file   = io.join(ALIGNMENT_PATH, 'align_affine.txt')
 align_reference_affine_file  = io.join(ALIGNMENT_PATH, 'align_affine.txt')
 align_reference_bspline_file = io.join(ALIGNMENT_PATH, 'align_bspline.txt')
 
-# ==== ==== Resampling ==== ====
+# ==== ==== Resampling ==== ==== 
+#resample stitched image to atlas resolution
 def resample_stitched():
     resample_parameter = {
         "source_resolution": tuple(VOXEL_SIZE_STITCHED),
-        "sink_resolution": tuple(VOXEL_SIZE_RESAMPLED),
+        "sink_resolution": tuple(VOXEL_SIZE_RESAMPLED), #target resolution
         "processes": None,
         "verbose": True,
     }
@@ -66,9 +93,10 @@ def resample_stitched():
 resample_stitched()
 
 # ==== ==== Alignment ==== ====
+#check result.mhd in ws.filename('auto_to_reference') folder
 def align_to_reference(): # Align resampled image to reference, save transform params
     align_reference_parameter = {
-        "moving_image": reference_file, 
+        "moving_image": reference_file, #moving the reference to the sample
         "fixed_image": ws.filename('resampled'),
         "affine_parameter_file": align_reference_affine_file,
         "bspline_parameter_file": align_reference_bspline_file,
@@ -89,7 +117,8 @@ def transformation(coordinates):
     coordinates = elx.transform_points(
         coordinates, sink=None,
         transform_directory=ws.filename('auto_to_reference'), #transform to reference space 
-        binary=True, indices=False
+        binary=False, 
+        indices=True #indices = true for voxel coordinates, false for spatial coordinates
     )
     return coordinates
 
@@ -104,9 +133,9 @@ def process_cell_class(class_idx):
     # 1. Load points for this class
     cell_points_file = os.path.join(CELL_CENTROIDS_DIR, f'obj_{class_idx}.csv')
     with open(cell_points_file, newline='') as csvfile:
-        points = np.array(list(csv.reader(csvfile)), dtype=float)
+        points = np.array(list(csv.reader(csvfile)), dtype=float) #check 
     # 2. Transform coordinates
-    coordinates = points / ratio/ VOXEL_SIZE_ORIGINAL  # goes to stitched resolution
+    coordinates = points / ratio  #pixel coordinate 
     coordinates_transformed = transformation(coordinates)
     # 3. Annotation
     label = ano.label_points(coordinates_transformed, annotation_file, key='graph_order')

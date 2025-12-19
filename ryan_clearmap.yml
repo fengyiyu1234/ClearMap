@@ -377,7 +377,7 @@ dependencies:
   - ujson=5.5.0=py37hd23a5d3_0
   - unicodedata2=14.0.0=py37h540881e_1
   - urllib3=2.2.1=pyhd8ed1ab_0
-  - vispy=0.6.6=py37h172d21f_0
+  - vispy=0.6.0=py37h172d21f_0
   - watchdog=2.1.9=py37h89c1867_0
   - wcwidth=0.2.10=pyhd8ed1ab_0
   - webencodings=0.5.1=pyhd8ed1ab_2

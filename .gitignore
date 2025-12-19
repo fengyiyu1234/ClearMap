@@ -64,3 +64,6 @@ Documentation.zip
 
 # Custom scripts
 ClearMap/custom_scripts
+
+*.lzma
+*.tif
