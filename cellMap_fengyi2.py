@@ -6,6 +6,8 @@ Organized for clarity and maintainability.
 #make sure input points are in pixel coordinates of the stitched image
 #if spatial coordinate, transform_points(indices=False)
 #nohup python cellMap_fengyi2.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/log/registration_.txt &
+#conda activate ClearMap
+#change annotation file name in /ClearMap/Alignment/Annotation.py
 import os
 import csv
 import shutil
@@ -15,14 +17,14 @@ import numpy.lib.recfunctions as rfn
 
 # ==== === Project/Experiment Parameters === ===
 STITCHED_FILENAME = 'registration.tif'
-DATA_DIR = '/data/hdd12tb-1/fengyi/COMBINe/clearmap/fw9'
+DATA_DIR = '/data/hdd12tb-1/fengyi/COMBINe/clearmap_p5/ff8'
 CELL_CENTROIDS_DIR = os.path.join(DATA_DIR, 'cell_centroids')
 RESOURCES_DIR = None # will be set later by settings.resources_path
 
-VOXEL_SIZE_ORIGINAL = np.array([0.65, 0.65, 10])      # raw data resolution
-VOXEL_SIZE_STITCHED = np.array([5.2, 5.2, 10])        # pixel size of registration.tif: compare the max resolution stitched images (0.65um pixel size) to the unknown stitched image 
+VOXEL_SIZE_ORIGINAL = np.array([0.65, 0.65, 20])      # raw data resolution
+VOXEL_SIZE_STITCHED = np.array([5.2,5.2, 20])        # pixel size of registration.tif: compare the max resolution stitched images (0.65um pixel size) to the unknown stitched image 
                                                         #normally the 5th resolution in terastitcher is 5.2um pixel size 
-VOXEL_SIZE_RESAMPLED = np.array([25, 25, 25])         # resampled/atlas
+VOXEL_SIZE_RESAMPLED = np.array([20, 20, 20])         # resampled/atlas
 N_CLASSES = 6                                         # number of cell classes
 
 ratio = VOXEL_SIZE_STITCHED / VOXEL_SIZE_ORIGINAL
@@ -65,13 +67,12 @@ sys.stdout.flush()
 #output: ClearMap/Resources/Atlas/
 def prepare_annotation():
     """Adjust and prepare annotation/reference files."""
-    annotation_file, vol_annotation_file, reference_file, distance_file = ano.prepare_annotation_files(
-        slicing=(slice(None),slice(None),slice(None)), orientation=(-3,-1,-2), #change the order of axes, reorient registration
+    annotation_file, vol_annotation_file, reference_file = ano.prepare_annotation_files(
+        slicing=(slice(None),slice(None),slice(None)), orientation=(1,2,3), #change the order of axes, reorient registration #(-3,-1,-2) for 2017 adult atlas
         overwrite=True, verbose=True)
-    return annotation_file, vol_annotation_file, reference_file, distance_file
+    return annotation_file, vol_annotation_file, reference_file
 
-(annotation_file, vol_annotation_file, 
- reference_file, distance_file) = prepare_annotation()
+(annotation_file, vol_annotation_file, reference_file) = prepare_annotation()
 
 # Alignment parameter files
 ALIGNMENT_PATH = os.path.join(RESOURCES_DIR, 'Alignment')
@@ -131,15 +132,48 @@ def insertdir(parent_file, i, name='cell_registration'):
 
 def process_cell_class(class_idx):
     # 1. Load points for this class
-    cell_points_file = os.path.join(CELL_CENTROIDS_DIR, f'obj_{class_idx}.csv')
+    cell_points_file = os.path.join(CELL_CENTROIDS_DIR, f'ob_{class_idx}.csv')
     with open(cell_points_file, newline='') as csvfile:
         points = np.array(list(csv.reader(csvfile)), dtype=float) #check 
     # 2. Transform coordinates
     coordinates = points / ratio  #pixel coordinate 
     coordinates_transformed = transformation(coordinates)
     # 3. Annotation
-    label = ano.label_points(coordinates_transformed, annotation_file, key='graph_order')
-    names = ano.convert_label(label, key='graph_order', value='name')
+    # 3.1 获取原始 ID (key=None, 获取纯数值)
+    raw_ids = ano.label_points(coordinates_transformed, annotation_file, key=None)
+    # 3.2 初始化结果数组
+    # graph_order 默认给 0
+    label_values = np.zeros(len(raw_ids), dtype=int)
+    # name 默认给 'background' (对应 id=0 的情况)
+    name_values = np.array(['background'] * len(raw_ids), dtype='object')
+    # 3.3 定义掩膜 (Masks)
+    mask_0 = (raw_ids == 0)
+    mask_neg1 = (raw_ids == -1)
+    # 合法点：既不是 0 也不是 -1 的点
+    mask_valid = ~(mask_0 | mask_neg1)
+    # 3.4 手动赋值特殊情况
+    # ID = 0 -> 'background' (初始化时已设置，这里为了逻辑清晰可省略，或保留)
+    name_values[mask_0] = 'background'
+
+    # ID = -1 -> 'no label'
+    if np.any(mask_neg1):
+        name_values[mask_neg1] = 'no label'
+        # 如果你希望 -1 的 graph_order 也是特殊值(比如 -1)，可以在这里改：
+        # label_values[mask_neg1] = -1 
+    
+    # 3.5 查表转换剩下的合法点
+    if np.any(mask_valid):
+        # 只对非0且非-1的点调用 ClearMap 查找
+        try:
+            valid_ids = raw_ids[mask_valid]
+
+            #label_values[mask_valid] = ano.convert_label(valid_ids, key='id', value='graph_order')
+            label_values[mask_valid] = valid_ids #直接使用 ID 而不是 graph_order
+
+            name_values[mask_valid] = ano.convert_label(valid_ids, key='id', value='name')
+        except Exception as e:
+            print(f"Warning: Error converting labels for class {class_idx}. Details: {e}")
+
     # 4. Voxelization
     voxelization_parameter = dict(
         shape=io.shape(annotation_file),

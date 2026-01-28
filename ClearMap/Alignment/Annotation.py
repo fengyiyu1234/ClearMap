@@ -18,6 +18,7 @@ Notes
     the 'annotation.json' file but the location can be set
     via :const:`default_label_file`.     
       
+  fengyi:removed distance to surface related code
 References
 ----------
   - `Allen Brain Atlas <http://mouse.brain-map.org/static/atlas>`_  
@@ -57,50 +58,53 @@ atlas_path = os.path.join(settings.resources_path, 'Atlas');
 """Default path to atlas infomration.
 """
 
-default_annotation_file = os.path.join(atlas_path, 'ABA_25um_annotation.tif');
+default_annotation_file = os.path.join(atlas_path, 'DeMBA_P5_2022_20um.tif');
 """Default volumetric annotated image file.
 
 Note
 ----
   This file is by default the Allen brain annotated mouse atlas with 25um 
   isotropic resolution.
+  fengyi: this is annotation.tif
 """
 fu.uncompress(default_annotation_file)
 
 # Rene
-default_vol_annotation_file = os.path.join(atlas_path, 'ABA_25um_annotation_vol.tif');
+default_vol_annotation_file = os.path.join(atlas_path, 'DeMBA_P5_2022_20um_vol.tif');
 """Default volumetric annotated image file.
 
 Note
 ----
   This file is for volume transform.
+  fengyi: this is annotation_vol.tif, looks the same as annotation.tif
 """
 fu.uncompress(default_vol_annotation_file)
 
 
-default_reference_file = os.path.join(atlas_path, 'ABA_25um_reference.tif');
+default_reference_file = os.path.join(atlas_path, 'DeMBA_P5_brain.tif');
 """Default volumetric annotated image file.
 
 Note
 ----
   This file is by default the Allen brain annotated mouse atlas with 25um 
   isotropic resolution.
+  fengyi: this is the brain image (reference.tif)
 """
 fu.uncompress(default_reference_file)
 
 
-default_distance_to_surface_file = os.path.join(atlas_path, 'ABA_25um_distance_to_surface.tif');
-"""Default volumetric annotated image file.
+# default_distance_to_surface_file = os.path.join(atlas_path, 'ABA_25um_distance_to_surface.tif');
+# """Default volumetric annotated image file.
 
-Note
-----
-  This file is by default the Allen brain annotated mouse atlas with 25um 
-  isotropic resolution.
-"""
-fu.uncompress(default_distance_to_surface_file)
+# Note
+# ----
+#   This file is by default the Allen brain annotated mouse atlas with 25um 
+#   isotropic resolution.
+# """
+# fu.uncompress(default_distance_to_surface_file)
 
 
-default_label_file = os.path.join(atlas_path, 'ABA_annotation.json');
+default_label_file = os.path.join(atlas_path, 'CCF_v3_ontology.json');
 """Default list of labels and region names in the annotated image.
 
 Note
@@ -689,7 +693,7 @@ def prepare_annotation_files(slicing = None, orientation = None,
                              annotation_file = None,
                              vol_annotation_file = None,
                              reference_file = None, 
-                             distance_to_surface_file = None,
+                             #distance_to_surface_file = None,
                              overwrite = False, verbose = False):
   """Crop the annotation, reference and distance files to match the data.
   
@@ -731,10 +735,10 @@ def prepare_annotation_files(slicing = None, orientation = None,
     vol_annotation_file = default_vol_annotation_file;
   if reference_file is None:
     reference_file = default_reference_file;
-  if distance_to_surface_file is None:
-    distance_to_surface_file = default_distance_to_surface_file;
+  # if distance_to_surface_file is None:
+  #   distance_to_surface_file = default_distance_to_surface_file;
 
-  files = [annotation_file, vol_annotation_file, reference_file, distance_to_surface_file];
+  files = [annotation_file, vol_annotation_file, reference_file]; #distance_to_surface_file
   
   results = [];
   for f in files:
