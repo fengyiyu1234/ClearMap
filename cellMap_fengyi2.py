@@ -5,7 +5,7 @@ Organized for clarity and maintainability.
 """
 #make sure input points are in pixel coordinates of the stitched image
 #if spatial coordinate, transform_points(indices=False)
-#nohup python cellMap_fengyi2.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/log/registration_.txt &
+#nohup python cellMap_fengyi2.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap_p5_trimmed_atlas/log/.txt &
 #conda activate ClearMap
 #change annotation file name in /ClearMap/Alignment/Annotation.py
 import os
@@ -17,15 +17,17 @@ import numpy.lib.recfunctions as rfn
 
 # ==== === Project/Experiment Parameters === ===
 STITCHED_FILENAME = 'registration.tif'
-DATA_DIR = '/data/hdd12tb-1/fengyi/COMBINe/clearmap_p5/ff8'
+DATA_DIR = '/data/hdd12tb-1/fengyi/COMBINe/clearmap_p5_trimmed_atlas/fw9_'
 CELL_CENTROIDS_DIR = os.path.join(DATA_DIR, 'cell_centroids')
 RESOURCES_DIR = None # will be set later by settings.resources_path
 
-VOXEL_SIZE_ORIGINAL = np.array([0.65, 0.65, 20])      # raw data resolution
-VOXEL_SIZE_STITCHED = np.array([5.2,5.2, 20])        # pixel size of registration.tif: compare the max resolution stitched images (0.65um pixel size) to the unknown stitched image 
-                                                        #normally the 5th resolution in terastitcher is 5.2um pixel size 
-VOXEL_SIZE_RESAMPLED = np.array([20, 20, 20])         # resampled/atlas
-N_CLASSES = 6                                         # number of cell classes
+#resolution: all pixel coordinates
+VOXEL_SIZE_ORIGINAL = np.array([0.65, 0.65, 20])     # raw data resolution
+VOXEL_SIZE_STITCHED = np.array([5.2,5.2, 10])        # pixel size of registration.tif: compare the max resolution stitched images (0.65um pixel size) to the unknown stitched image 
+                                                     # normally the 5th resolution in terastitcher is 5.2um pixel size 
+                                                     # z voxel size could be different from original size due to stitching
+VOXEL_SIZE_RESAMPLED = np.array([20, 20, 20])        # resampled/atlas
+N_CLASSES = 6                                        # number of cell classes
 
 ratio = VOXEL_SIZE_STITCHED / VOXEL_SIZE_ORIGINAL
 
@@ -68,7 +70,8 @@ sys.stdout.flush()
 def prepare_annotation():
     """Adjust and prepare annotation/reference files."""
     annotation_file, vol_annotation_file, reference_file = ano.prepare_annotation_files(
-        slicing=(slice(None),slice(None),slice(None)), orientation=(1,2,3), #change the order of axes, reorient registration #(-3,-1,-2) for 2017 adult atlas
+        slicing=(slice(None),slice(None),slice(None)), orientation=(1,-2,-3),   #change the order of axes ((-3,-1,-2) for 2017 adult atlas )
+                                                                                #1,2,3: x,y,z
         overwrite=True, verbose=True)
     return annotation_file, vol_annotation_file, reference_file
 
@@ -110,14 +113,14 @@ align_to_reference()
 # ==== ==== Cell Points Transformation & Annotation ==== ====
 def transformation(coordinates):
     """Resample & transform coordinates to reference space."""
-    coordinates = res.resample_points( #no change in orientation
+    coordinates = res.resample_points( 
         coordinates, sink=None, orientation=None, 
         source_shape=io.shape(ws.filename('stitched')),
         sink_shape=io.shape(ws.filename('resampled')) #downsample
     )
     coordinates = elx.transform_points(
         coordinates, sink=None,
-        transform_directory=ws.filename('auto_to_reference'), #transform to reference space 
+        transform_directory=ws.filename('auto_to_reference'), 
         binary=False, 
         indices=True #indices = true for voxel coordinates, false for spatial coordinates
     )
@@ -130,92 +133,6 @@ def insertdir(parent_file, i, name='cell_registration'):
         os.makedirs(dir_inserted)
     return os.path.join(dir_inserted, os.path.basename(parent_file))
 
-# def process_cell_class(class_idx):
-#     # 1. Load points for this class
-#     cell_points_file = os.path.join(CELL_CENTROIDS_DIR, f'ob_{class_idx}.csv')
-#     with open(cell_points_file, newline='') as csvfile:
-#         points = np.array(list(csv.reader(csvfile)), dtype=float) #check 
-#     # 2. Transform coordinates
-#     coordinates = points / ratio  #pixel coordinate 
-#     coordinates_transformed = transformation(coordinates)
-    
-#     # 3. Annotation
-
-#     # 3.1 确保坐标是整数索引
-#     indices = np.round(coordinates_transformed).astype(int)
-    
-#     # 3.2 检查边界 (防止坐标超出地图范围报错)
-#     sh = annotation_file.shape
-#     # 判断每个点是否在 x, y, z 的合法范围内
-#     valid_x = (indices[:, 0] >= 0) & (indices[:, 0] < sh[0])
-#     valid_y = (indices[:, 1] >= 0) & (indices[:, 1] < sh[1])
-#     valid_z = (indices[:, 2] >= 0) & (indices[:, 2] < sh[2])
-#     valid_mask = valid_x & valid_y & valid_z
-    
-#     # 3.3 直接从 annotation_file 数组中读取 ID
-#     # 初始化所有点为 0 (背景)
-#     raw_ids = np.zeros(len(indices), dtype=int)
-    
-#     # 只读取合法的点 (利用 Numpy 高级索引)
-#     if np.any(valid_mask):
-#         raw_ids[valid_mask] = annotation_file[
-#             indices[valid_mask, 0],
-#             indices[valid_mask, 1],
-#             indices[valid_mask, 2]
-#         ]
-    
-#     # 初始化结果数组
-#     label_values = np.zeros(len(raw_ids), dtype=int)
-#     name_values = np.array(['background'] * len(raw_ids), dtype='object')
-    
-#     # 定义掩膜
-#     mask_0 = (raw_ids == 0)
-#     mask_neg1 = (raw_ids == -1)
-#     mask_valid_id = ~(mask_0 | mask_neg1) # 既不是0也不是-1
-    
-#     # 处理特殊值
-#     if np.any(mask_neg1):
-#         name_values[mask_neg1] = 'no label'
-        
-#     # 处理正常 ID (查表转换)
-#     if np.any(mask_valid_id):
-#         try:
-#             valid_ids = raw_ids[mask_valid_id]
-#             # 这里调用 convert_label 可能会因为字典缺失报错，加 try-except
-#             label_values[mask_valid_id] = ano.convert_label(valid_ids, key='id', value='graph_order')
-#             name_values[mask_valid_id] = ano.convert_label(valid_ids, key='id', value='name')
-#         except Exception as e:
-#             print(f"Warning: Mapping error in class {class_idx}. Setting unmapped to background.")
-#             # 查不到的保持默认 background 即可
-
-#     # 4. Voxelization
-#     voxelization_parameter = dict(
-#         shape=io.shape(annotation_file),
-#         dtype=None,
-#         weights=None,
-#         method='sphere',
-#         radius=(1,1,1),
-#         kernel=None,
-#         processes=None,
-#         verbose=True
-#     )
-#     vox.voxelize(
-#         coordinates_transformed,
-#         sink=insertdir(ws.filename('density', postfix='counts'), class_idx),
-#         **voxelization_parameter
-#     )
-#     # 5. Save results (npz and csv)
-#     points.dtype = [(c, float) for c in ('x', 'y', 'z')]
-#     coordinates_transformed.dtype = [(t, float) for t in ('xt', 'yt', 'zt')]
-#     label = np.array(label, dtype=[('graph_order', int)])
-#     names = np.array(names, dtype=[('name', 'a256')])
-#     cells_data = rfn.merge_arrays([points, coordinates_transformed, label, names], flatten=True, usemask=False)
-#     io.write(insertdir(ws.filename('cell_registration'), class_idx), cells_data)
-#     np.savetxt(
-#         insertdir(ws.filename('cell_registration', extension='csv'), class_idx), 
-#         cells_data, delimiter=',', fmt='%s'
-#     )
-
 def process_cell_class(class_idx):
     # 1. Load points for this class
     cell_points_file = os.path.join(CELL_CENTROIDS_DIR, f'ob_{class_idx}.csv')
@@ -227,8 +144,8 @@ def process_cell_class(class_idx):
         points = np.array(list(csv.reader(csvfile)), dtype=float)
     
     # 2. Transform coordinates
-    coordinates = points / ratio  # pixel coordinate 
-    coordinates_transformed = transformation(coordinates)
+    coordinates = points / ratio  # downsampled to stitched image space
+    coordinates_transformed = transformation(coordinates) #transformed to atlas space
     
     # 3. Annotation (使用内存中的 atlas_volume 数组) =========================
     
@@ -302,8 +219,11 @@ def process_cell_class(class_idx):
     )
     
     # 5. Save results
-    points.dtype = [(c, float) for c in ('x', 'y', 'z')]
-    coordinates_transformed.dtype = [(t, float) for t in ('xt', 'yt', 'zt')]
+    # points.dtype = [(c, float) for c in ('x', 'y', 'z')]
+    # coordinates_transformed.dtype = [(t, float) for t in ('xt', 'yt', 'zt')]
+    points = points.view([(c, float) for c in ('x', 'y', 'z')])
+    coordinates_transformed = coordinates_transformed.view([(t, float) for t in ('xt', 'yt', 'zt')])
+    
     label_struct = np.array(label_values, dtype=[('graph_order', int)])
     names_struct = np.array(name_values, dtype=[('name', 'S256')])
 
