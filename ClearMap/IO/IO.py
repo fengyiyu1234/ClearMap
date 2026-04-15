@@ -16,6 +16,10 @@ __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__   = 'http://idisco.info'
 __download__  = 'http://www.github.com/ChristophKirst/ClearMap2'
 
+try:
+    import nibabel as nib
+except ImportError:
+    nib = None
 
 import importlib
 import functools
@@ -138,6 +142,7 @@ def filename_to_module(filename):
     raise ValueError("Cannot determine module for file %s with extension %s!" % (filename, ext));
 
   return mod;    
+
 
 ##############################################################################
 ### IO Interface

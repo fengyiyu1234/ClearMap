@@ -54,11 +54,11 @@ import ClearMap.Visualization.Color as col
 ###############################################################################
 
 #TODO: move to settings ?
-atlas_path = os.path.join(settings.resources_path, 'Atlas');
+atlas_path = os.path.join(settings.resources_path, 'Atlas','p5_trimmed');
 """Default path to atlas infomration.
 """
 
-default_annotation_file = os.path.join(atlas_path, 'DeMBA_P5_2022_20um.tif');
+default_annotation_file = os.path.join(atlas_path, 'DeMBA_P5_annotation_trimmed.tif');
 """Default volumetric annotated image file.
 
 Note
@@ -70,7 +70,7 @@ Note
 fu.uncompress(default_annotation_file)
 
 # Rene
-default_vol_annotation_file = os.path.join(atlas_path, 'DeMBA_P5_2022_20um_vol.tif');
+default_vol_annotation_file = os.path.join(atlas_path, 'DeMBA_P5_annotation_trimmed_vol.tif');
 """Default volumetric annotated image file.
 
 Note
@@ -81,7 +81,7 @@ Note
 fu.uncompress(default_vol_annotation_file)
 
 
-default_reference_file = os.path.join(atlas_path, 'DeMBA_P5_brain.tif');
+default_reference_file = os.path.join(atlas_path, 'DeMBA_P5_reference_trimmed.tif');
 """Default volumetric annotated image file.
 
 Note
