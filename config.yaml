@@ -1,28 +1,29 @@
 # 路径配置
 paths:
-  data_dir: "/data/hdd12tb-1/fengyi/COMBINe/clearmap_samples/batch2_sample1"
-  stitched_filename: "registration.npy"
+  data_dir: "/data/hdd12tb-1/fengyi/COMBINe/clearmap/egfr_sample5_p5"
+  stitched_filename: "registration.npy" #convert .tif to .npy if the file is too large
 
 # 分辨率配置 (单位: um)
 resolution:
-  original: [0.65, 0.65, 10] #resolution of detection results, usually the same as the original image
-  stitched: [2.6, 2.6, 10.0]  #resolution of the stitched image
+  original: [0.65, 0.65, 8] #resolution of detection results, usually the same as the original image
+  stitched: [5.2, 5.2, 16.0]  #resolution of the stitched image
   resampled: [20.0, 20.0, 20.0] #resolution of p5 atlas, no need to change as long as you are using p5 atlas
 
 # 配准参数
 registration:
   # change the orientation of atlas to match the orientation of the stitched image, the slicing should also be changed accordingly
-  orientation: [1, 2, 3] 
+  orientation: [-3, 2, 1] 
 
-  # if orientation is [1,2,3]:
-    # the 1st axis cuts the brain into left and right halves, sagittal slicing
-    # the 2nd axis cuts the brain into top and bottom halves, horizontal slicing
-    # the 3rd axis cuts the brain into front and back halves, coronal slicing
-  #if change orientation, the slicing should also be changed accordingly
+  # slicing: 
+  #default orientation: [1,2,3]
+    # the 1st plane cuts the brain into left and right halves, sagittal slicing
+    # the 2nd plane cuts the brain into top and bottom halves, horizontal slicing
+    # the 3rd plane cuts the brain into front and back halves, coronal slicing
+    #if orientation is not default, the slicing should also be changed accordingly
   
   slicing: 
     - null
-    - [285,null]
+    - null
     - null 
 
 # 细胞分类配置
