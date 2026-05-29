@@ -5,7 +5,7 @@ Organized for clarity and maintainability.
 """
 #make sure input points are in pixel coordinates of the stitched image
 #if spatial coordinate, transform_points(indices=False)
-#nohup python cellMap.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap_samples/batch2_sample1/log.txt &
+#nohup python cellMap.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/egfr_sample5_p5/log.txt &
 #conda activate ClearMap
 #change annotation file name in /ClearMap/Alignment/Annotation.py
 import os
@@ -49,6 +49,8 @@ def parse_slicing(slicing_list):
 
 MY_SLICING = parse_slicing(cfg['registration']['slicing'])
 MY_ORIENTATION = tuple(cfg['registration']['orientation'])
+CROP_CONFIG = cfg['registration'].get('crop_for_registration', None)
+CROP_OFFSET = np.array([0, 0, 0], dtype=float)  # set by crop_resampled_for_registration()
 
 # ==== ==== Workspace Setup ==== ====
 ws = wsp.Workspace('CellMap', directory=DATA_DIR)
@@ -95,7 +97,7 @@ align_channels_affine_file   = io.join(ALIGNMENT_PATH, 'align_affine.txt')
 align_reference_affine_file  = io.join(ALIGNMENT_PATH, 'align_affine.txt')
 align_reference_bspline_file = io.join(ALIGNMENT_PATH, 'align_bspline.txt')
 
-# ==== ==== Resampling ==== ==== 
+# ==== ==== Resampling ==== ====
 #resample stitched image to atlas resolution
 def resample_stitched():
     resample_parameter = {
@@ -108,12 +110,37 @@ def resample_stitched():
 
 resample_stitched()
 
+# ==== ==== Crop resampled for registration ==== ====
+RESAMPLED_FOR_REG = os.path.join(DATA_DIR, 'resampled_cropped.tif')
+
+def crop_resampled_for_registration():
+    """Crop resampled image to brain region; returns path to use for registration.
+    Coordinates are in voxels of the resampled image (@ 20um).
+    Sets CROP_OFFSET so transformation() can correct cell coordinates.
+    """
+    global CROP_OFFSET
+    if CROP_CONFIG is None or all(CROP_CONFIG.get(k) is None for k in ('x', 'y', 'z')):
+        print("No crop configured — using full resampled image for registration.")
+        return ws.filename('resampled')
+
+    img = io.read(ws.filename('resampled'))  # ClearMap: (X, Y, Z)
+    x1, x2 = CROP_CONFIG['x'] if CROP_CONFIG.get('x') else (0, img.shape[0])
+    y1, y2 = CROP_CONFIG['y'] if CROP_CONFIG.get('y') else (0, img.shape[1])
+    z1, z2 = CROP_CONFIG['z'] if CROP_CONFIG.get('z') else (0, img.shape[2])
+
+    CROP_OFFSET = np.array([x1, y1, z1], dtype=float)
+    cropped = img[x1:x2, y1:y2, z1:z2]
+    io.write(RESAMPLED_FOR_REG, cropped)
+    print(f"Cropped resampled image: {img.shape} -> {cropped.shape}, offset={CROP_OFFSET}")
+    return RESAMPLED_FOR_REG
+
 # ==== ==== Alignment ==== ====
 #check result.mhd in ws.filename('auto_to_reference') folder
 def align_to_reference(): # Align resampled image to reference, save transform params
+    fixed_image = crop_resampled_for_registration()
     align_reference_parameter = {
         "moving_image": reference_file, #moving the reference to the sample
-        "fixed_image": ws.filename('resampled'),
+        "fixed_image": fixed_image,
         "affine_parameter_file": align_reference_affine_file,
         "bspline_parameter_file": align_reference_bspline_file,
         "result_directory": ws.filename('auto_to_reference')
@@ -125,16 +152,17 @@ align_to_reference()
 # ==== ==== Cell Points Transformation & Annotation ==== ====
 def transformation(coordinates):
     """Resample & transform coordinates to reference space."""
-    coordinates = res.resample_points( 
-        coordinates, sink=None, orientation=None, 
+    coordinates = res.resample_points(
+        coordinates, sink=None, orientation=None,
         source_shape=io.shape(ws.filename('stitched')),
-        sink_shape=io.shape(ws.filename('resampled')) #downsample
+        sink_shape=io.shape(ws.filename('resampled'))  # always use full resampled shape
     )
+    coordinates = coordinates - CROP_OFFSET  # shift into cropped image coordinate system
     coordinates = elx.transform_points(
         coordinates, sink=None,
-        transform_directory=ws.filename('auto_to_reference'), 
-        binary=False, 
-        indices=True #indices = true for voxel coordinates, false for spatial coordinates
+        transform_directory=ws.filename('auto_to_reference'),
+        binary=False,
+        indices=True  # voxel coordinates
     )
     return coordinates
 
