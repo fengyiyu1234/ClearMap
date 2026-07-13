@@ -67,3 +67,6 @@ ClearMap/custom_scripts
 
 *.lzma
 *.tif
+
+# Local config
+config.yaml

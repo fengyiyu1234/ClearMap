@@ -5,13 +5,16 @@ Organized for clarity and maintainability.
 """
 #make sure input points are in pixel coordinates of the stitched image
 #if spatial coordinate, transform_points(indices=False)
-#nohup python cellMap.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/egfr_sample5_p5/log.txt &
-#conda activate ClearMap
-#change annotation file name in /ClearMap/Alignment/Annotation.py
+# nohup python cellMap.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/s18/log.txt
 import os
+# Headless servers have no X11 display, but ClearMap.Environment pulls in
+# Qt-based plotting modules on import (unused here); force the offscreen
+# Qt backend so that import doesn't crash. Doesn't override if already set.
+os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import csv
 import shutil
 import numpy as np
+import tifffile
 from ClearMap.Environment import *
 import numpy.lib.recfunctions as rfn
 import glob
@@ -27,7 +30,37 @@ cfg = load_config()
 
 # ==== 2. 映射参数 ====
 DATA_DIR = cfg['paths']['data_dir']
-STITCHED_FILENAME = cfg['paths']['stitched_filename']
+
+def ensure_stitched_npy(stitched_filename):
+    """If enabled in config, convert stitched .tif -> .npy since ClearMap
+    can't read very large TIF stacks directly. Skips if the .npy already
+    exists."""
+    if not cfg['paths'].get('convert_tif_to_npy', False):
+        return stitched_filename
+
+    base, _ = os.path.splitext(stitched_filename)
+    npy_filename = base + '.npy'
+    npy_path = os.path.join(DATA_DIR, npy_filename)
+    tif_path = os.path.join(DATA_DIR, base + '.tif')
+
+    if os.path.exists(npy_path):
+        print(f"Found existing {npy_path}, skipping TIF->NPY conversion.")
+        return npy_filename
+
+    if not os.path.exists(tif_path):
+        raise FileNotFoundError(
+            f"convert_tif_to_npy is enabled but no TIF found at {tif_path}")
+
+    print(f"Converting {tif_path} -> {npy_path} ...")
+    img_array = tifffile.imread(tif_path)
+    img_array = np.transpose(img_array, (2, 1, 0))  # (Z,Y,X) -> (X,Y,Z)
+    tmp_path = npy_path + '.tmp.npy'
+    np.save(tmp_path, img_array)
+    os.replace(tmp_path, npy_path)
+    print(f"Conversion complete: shape {img_array.shape}")
+    return npy_filename
+
+STITCHED_FILENAME = ensure_stitched_npy(cfg['paths']['stitched_filename'])
 CELL_CENTROIDS_DIR = os.path.join(DATA_DIR, 'cell_centroids')
 
 VOXEL_SIZE_ORIGINAL = np.array(cfg['resolution']['original'])
@@ -35,6 +68,7 @@ VOXEL_SIZE_STITCHED = np.array(cfg['resolution']['stitched'])
 VOXEL_SIZE_RESAMPLED = np.array(cfg['resolution']['resampled'])
 ratio = VOXEL_SIZE_STITCHED / VOXEL_SIZE_ORIGINAL
 CELL_PREFIX = cfg.get('cells', {}).get('prefix', 'ob_')
+SAVE_DENSITY_TIF = cfg.get('cells', {}).get('save_density_tif', True)
 
 # 处理 Slicing 元组转换
 def parse_slicing(slicing_list):
@@ -50,7 +84,7 @@ def parse_slicing(slicing_list):
 MY_SLICING = parse_slicing(cfg['registration']['slicing'])
 MY_ORIENTATION = tuple(cfg['registration']['orientation'])
 CROP_CONFIG = cfg['registration'].get('crop_for_registration', None)
-CROP_OFFSET = np.array([0, 0, 0], dtype=float)  # set by crop_resampled_for_registration()
+CROP_OFFSET = np.array([0, 0, 0], dtype=float)  
 
 # ==== ==== Workspace Setup ==== ====
 ws = wsp.Workspace('CellMap', directory=DATA_DIR)
@@ -80,12 +114,31 @@ sys.stdout.flush()
 
 # ==== ==== Annotation & Reference Preparation ==== ====
 #output: ClearMap/Resources/Atlas/
+def build_annotation_postfix(orientation, slicing):
+    """Short, deterministic postfix derived from orientation/slicing (instead
+    of ClearMap's default, which spells out the full slice-object repr and
+    gets unwieldy long). Same params -> same postfix, so samples sharing an
+    orientation/slicing reuse the same generated atlas files."""
+    orient_part = '_'.join(str(o) for o in orientation)
+    if slicing is None:
+        slicing_part = 'full'
+    else:
+        parts = []
+        for s in slicing:
+            if s.start is None and s.stop is None:
+                parts.append('full')
+            else:
+                parts.append(f'{s.start or 0}-{s.stop}')
+        slicing_part = '_'.join(parts)
+    return f'{orient_part}__{slicing_part}'
+
 def prepare_annotation():
     """使用从 config 加载的参数"""
     annotation_file, vol_annotation_file, reference_file = ano.prepare_annotation_files(
-        slicing=MY_SLICING, 
+        slicing=MY_SLICING,
         orientation=MY_ORIENTATION,
-        overwrite=True, 
+        postfix=build_annotation_postfix(MY_ORIENTATION, MY_SLICING),
+        overwrite=True,
         verbose=True)
     return annotation_file, vol_annotation_file, reference_file
 
@@ -238,24 +291,25 @@ def process_cell_class(class_name):
     
     # (结束自定义逻辑) =======================================================
 
-    # 4. Voxelization
-    voxelization_parameter = dict(
-        shape=sh,  # 直接用 shape
-        dtype=None,
-        weights=None,
-        method='sphere',
-        radius=(1,1,1),
-        kernel=None,
-        processes=None,
-        verbose=True
-    )
-    
-    vox.voxelize(
-        coordinates_transformed,
-        sink=insertdir(ws.filename('density', postfix='counts'), class_name),
-        **voxelization_parameter
-    )
-    
+    # 4. Voxelization (density counts tif — full atlas-resolution volume, can be very large)
+    if SAVE_DENSITY_TIF:
+        voxelization_parameter = dict(
+            shape=sh,  # 直接用 shape
+            dtype=None,
+            weights=None,
+            method='sphere',
+            radius=(1,1,1),
+            kernel=None,
+            processes=None,
+            verbose=True
+        )
+
+        vox.voxelize(
+            coordinates_transformed,
+            sink=insertdir(ws.filename('density', postfix='counts'), class_name),
+            **voxelization_parameter
+        )
+
     # 5. Save results
     # points.dtype = [(c, float) for c in ('x', 'y', 'z')]
     # coordinates_transformed.dtype = [(t, float) for t in ('xt', 'yt', 'zt')]
