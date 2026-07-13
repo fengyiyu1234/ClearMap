@@ -5,7 +5,7 @@ Organized for clarity and maintainability.
 """
 #make sure input points are in pixel coordinates of the stitched image
 #if spatial coordinate, transform_points(indices=False)
-# nohup python cellMap.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/s18/log.txt
+# nohup python cellMap.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/s12q/log.txt
 import os
 # Headless servers have no X11 display, but ClearMap.Environment pulls in
 # Qt-based plotting modules on import (unused here); force the offscreen
@@ -204,20 +204,24 @@ align_to_reference()
 
 # ==== ==== Cell Points Transformation & Annotation ==== ====
 def transformation(coordinates):
-    """Resample & transform coordinates to reference space."""
-    coordinates = res.resample_points(
+    """Resample & transform coordinates to reference space.
+
+    Returns both the resampled (pre-registration) coordinates and the
+    final atlas-registered coordinates.
+    """
+    resampled = res.resample_points(
         coordinates, sink=None, orientation=None,
         source_shape=io.shape(ws.filename('stitched')),
         sink_shape=io.shape(ws.filename('resampled'))  # always use full resampled shape
     )
-    coordinates = coordinates - CROP_OFFSET  # shift into cropped image coordinate system
+    coordinates = resampled - CROP_OFFSET  # shift into cropped image coordinate system
     coordinates = elx.transform_points(
         coordinates, sink=None,
         transform_directory=ws.filename('auto_to_reference'),
         binary=False,
         indices=True  # voxel coordinates
     )
-    return coordinates
+    return resampled, coordinates
 
 def insertdir(parent_file, i, name='cell_registration'):
     """Insert a label directory in file path."""
@@ -248,8 +252,8 @@ def process_cell_class(class_name):
         return
 
     # 2. Transform coordinates
-    coordinates = points / ratio  
-    coordinates_transformed = transformation(coordinates) 
+    coordinates = points / ratio
+    coordinates_resampled, coordinates_transformed = transformation(coordinates)
     
     # 3. Annotation (使用内存中的 atlas_volume 数组)
     indices = np.round(coordinates_transformed).astype(int)
@@ -312,14 +316,16 @@ def process_cell_class(class_name):
 
     # 5. Save results
     # points.dtype = [(c, float) for c in ('x', 'y', 'z')]
+    # coordinates_resampled.dtype = [(c, float) for c in ('xr', 'yr', 'zr')]
     # coordinates_transformed.dtype = [(t, float) for t in ('xt', 'yt', 'zt')]
     points = points.view([(c, float) for c in ('x', 'y', 'z')])
+    coordinates_resampled = coordinates_resampled.view([(c, float) for c in ('xr', 'yr', 'zr')])
     coordinates_transformed = coordinates_transformed.view([(t, float) for t in ('xt', 'yt', 'zt')])
-    
+
     label_struct = np.array(label_values, dtype=[('graph_order', int)])
     names_struct = np.array(name_values, dtype=[('name', 'S256')])
 
-    cells_data = rfn.merge_arrays([points, coordinates_transformed, label_struct, names_struct], flatten=True, usemask=False)
+    cells_data = rfn.merge_arrays([points, coordinates_resampled, coordinates_transformed, label_struct, names_struct], flatten=True, usemask=False)
     
     io.write(insertdir(ws.filename('cell_registration'), class_name), cells_data)
     np.savetxt(

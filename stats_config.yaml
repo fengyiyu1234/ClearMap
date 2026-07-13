@@ -1,0 +1,38 @@
+# Config for stats_group_compare.py
+# Usage: python stats_group_compare.py --config stats_config.yaml
+
+# Directory containing one subfolder per sample (e.g. s8, s12q, ...), each with
+# a cell_registration/<class_name>/cell_registration.csv produced by cellMap.py.
+data_dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC
+
+# Assign samples to the two groups being compared. Names must match the
+# sample subfolder names under data_dir. "name" is just a display label used
+# in the output (mean_a/mean_b columns, Excel sheet headers).
+groups:
+  a: {name: "Control", samples: [s8, s9, s10]}
+  b: {name: "Experimental", samples: [s12q, s13, s14]}
+
+# Cell classes (marker combinations) to analyze, e.g. ["glia_3_GFP"].
+# Leave null to auto-discover the union of cell_registration/ subfolders
+# across all listed samples.
+classes: null
+
+# Ontology JSON to use. Leave null to use ClearMap's bundled default
+# (ClearMap/Resources/Atlas/p5_trimmed/CCF_v3_ontology.json).
+label_file: null
+
+# Atlas volume used to compute region volumes for the Density metric (one
+# static lookup, independent of any single sample's registration crop).
+# Leave null to use ClearMap's bundled default p5 volume file.
+annotation_volume: null
+
+# Voxel size (um) of annotation_volume, for converting voxel counts to mm^3.
+voxel_size_um: [20.0, 20.0, 20.0]
+
+output:
+  dir: ./stats_output
+  long_table: region_stats.csv        # canonical tidy output, read by stats_img_vis_ui.py
+  excel: region_stats_by_level.xlsx   # human-browsable workbook, one sheet per ontology level
+
+# Cache for the (expensive, one-time) per-region volume computation.
+volume_cache: ./stats_output/atlas_region_volumes.csv
