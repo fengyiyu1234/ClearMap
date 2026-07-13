@@ -9,12 +9,14 @@ data_dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC
 # sample subfolder names under data_dir. "name" is just a display label used
 # in the output (mean_a/mean_b columns, Excel sheet headers).
 groups:
-  a: {name: "Control", samples: [s8, s9, s10]}
-  b: {name: "Experimental", samples: [s12q, s13, s14]}
+  a: {name: "Control", samples: [s18, s11, s10]}
+  b: {name: "Experimental", samples: [s12q, s12t, s8]}
 
 # Cell classes (marker combinations) to analyze, e.g. ["glia_3_GFP"].
 # Leave null to auto-discover the union of cell_registration/ subfolders
-# across all listed samples.
+# across all listed samples. Folder names are matched fuzzily per sample
+# (case-insensitive, ignoring purely-numeric tokens), so e.g. "glia_3_GFP"
+# and "glia_GFP" are treated as the same class.
 classes: null
 
 # Ontology JSON to use. Leave null to use ClearMap's bundled default
@@ -24,15 +26,15 @@ label_file: null
 # Atlas volume used to compute region volumes for the Density metric (one
 # static lookup, independent of any single sample's registration crop).
 # Leave null to use ClearMap's bundled default p5 volume file.
-annotation_volume: null
+annotation_volume: ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_annotation_trimmed_1_3_2__285-510_full_full.tif
 
 # Voxel size (um) of annotation_volume, for converting voxel counts to mm^3.
 voxel_size_um: [20.0, 20.0, 20.0]
 
 output:
-  dir: ./stats_output
+  dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/stats
   long_table: region_stats.csv        # canonical tidy output, read by stats_img_vis_ui.py
   excel: region_stats_by_level.xlsx   # human-browsable workbook, one sheet per ontology level
 
 # Cache for the (expensive, one-time) per-region volume computation.
-volume_cache: ./stats_output/atlas_region_volumes.csv
+volume_cache: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/stats/atlas_region_volumes.csv

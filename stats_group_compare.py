@@ -50,11 +50,11 @@ def clean_name(raw):
 
 def read_cell_registration(csv_path):
     """cell_registration.csv has no header; columns are (in order):
-    x, y, z, xt, yt, zt, graph_order, name. Over-allocate column names since
-    some rows can be ragged (trailing commas etc.)."""
+    x, y, z, xr, yr, zr, xt, yt, zt, graph_order, name. Over-allocate column
+    names since some rows can be ragged (trailing commas etc.)."""
     df = pd.read_csv(csv_path, header=None, names=range(20), engine='python')
-    graph_order = pd.to_numeric(df[6], errors='coerce').fillna(-1).astype(int).values
-    names = df[7].map(clean_name).values
+    graph_order = pd.to_numeric(df[9], errors='coerce').fillna(-1).astype(int).values
+    names = df[10].map(clean_name).values
     return graph_order, names
 
 
@@ -93,15 +93,58 @@ def class_counts_for_sample(csv_path):
 
 # ================= Ontology metadata & region volumes =================
 
+def normalize_class_key(name):
+    """Token-set key for fuzzy class-folder matching: lowercase, split on
+    non-alphanumerics, drop pure-numeric tokens (batch/version markers like
+    the '3' in 'glia_3_GFP') so naming drift across samples -- e.g.
+    'glia_3_GFP' vs 'glia_GFP' -- still resolves to the same class."""
+    tokens = re.split(r'[^a-zA-Z0-9]+', name)
+    return frozenset(t.lower() for t in tokens if t and not t.isdigit())
+
+
+def list_sample_classes(data_dir, sample):
+    reg_dir = os.path.join(data_dir, sample, 'cell_registration')
+    if not os.path.isdir(reg_dir):
+        return []
+    return sorted(d for d in os.listdir(reg_dir) if os.path.isdir(os.path.join(reg_dir, d)))
+
+
+def resolve_sample_class_dir(data_dir, sample, class_name, _cache={}):
+    """Find the actual cell_registration/<...> folder for `class_name` within
+    one sample, tolerating naming drift (see normalize_class_key). Returns
+    None if no folder matches."""
+    if sample not in _cache:
+        _cache[sample] = list_sample_classes(data_dir, sample)
+    actual = _cache[sample]
+
+    if class_name in actual:
+        return class_name
+
+    key = normalize_class_key(class_name)
+    matches = [d for d in actual if normalize_class_key(d) == key]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        print(f"  [warn] ambiguous class match for '{class_name}' in {sample}: {matches}; using '{matches[0]}'")
+    return matches[0]
+
+
 def discover_classes(data_dir, sample_names, explicit=None):
+    """Returns canonical class labels. When auto-discovering (explicit=None),
+    folder names found across samples are grouped by normalize_class_key so
+    that differently-named variants of the same marker combination (e.g.
+    'glia_3_GFP' on one sample, 'glia_GFP' on another) collapse into one
+    class instead of being treated as two."""
     if explicit:
         return list(explicit)
-    classes = set()
-    for s in sample_names:
-        reg_dir = os.path.join(data_dir, s, 'cell_registration')
-        if os.path.isdir(reg_dir):
-            classes.update(d for d in os.listdir(reg_dir) if os.path.isdir(os.path.join(reg_dir, d)))
-    return sorted(classes)
+
+    all_names = sorted({name for s in sample_names for name in list_sample_classes(data_dir, s)})
+    groups = {}
+    for name in all_names:
+        groups.setdefault(normalize_class_key(name), []).append(name)
+    # shortest (then alphabetically first) name in each group becomes the label
+    canonical = [min(names, key=lambda n: (len(n), n)) for names in groups.values()]
+    return sorted(canonical)
 
 
 def build_region_metadata():
@@ -158,8 +201,13 @@ def collect_counts(data_dir, classes, group_samples):
     for group_key, samples in group_samples.items():
         for sample in samples:
             for cls in classes:
-                csv_path = os.path.join(data_dir, sample, 'cell_registration', cls, 'cell_registration.csv')
-                bins, total = class_counts_for_sample(csv_path)
+                actual_dir = resolve_sample_class_dir(data_dir, sample, cls)
+                if actual_dir is None:
+                    print(f"  [warn] no folder matching class '{cls}' for sample {sample}, treating as zero cells")
+                    bins, total = np.zeros(n, dtype=float), 0
+                else:
+                    csv_path = os.path.join(data_dir, sample, 'cell_registration', actual_dir, 'cell_registration.csv')
+                    bins, total = class_counts_for_sample(csv_path)
                 count_frames.append(pd.DataFrame({
                     'group': group_key, 'sample': sample, 'class_name': cls,
                     'order': orders, 'count': bins,
