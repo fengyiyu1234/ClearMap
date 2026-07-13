@@ -8,8 +8,8 @@ import json
 import re
 
 # UI 相关 (新增了 QFileDialog 和 QMessageBox)
-from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame, 
-                             QCheckBox, QStackedWidget, QLineEdit, QPushButton, QDoubleSpinBox, 
+from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame,
+                             QCheckBox, QStackedWidget, QLineEdit, QPushButton, QDoubleSpinBox,
                              QFileDialog, QMessageBox, QGroupBox)
 from PyQt5.QtCore import Qt
 # Matplotlib 相关
@@ -22,72 +22,116 @@ from napari.utils.colormaps import Colormap
 
 CONFIG = {
     # 路径默认留空，由用户在 UI 中自行选择
-    "parent_data_dir": "", 
-    "stats_excel": "",
+    "parent_data_dir": "",
+    "stats_long_table": "",   # region_stats.csv produced by stats_group_compare.py
     "std_atlas_path": "",
-    "ontology_json_path": "", 
+    "ontology_json_path": "",
 
-    # 5. 分辨率参数 [X, Y, Z] (单位: um)
-    "res_raw":   np.array([0.65, 0.65, 20.0]), 
-    "res_atlas": np.array([20.0, 20.0, 20.0]), # 20um for p5 atlas
+    # 5. 分辨率参数 [X, Y, Z] (单位: um) -- 仅用于 Native 视图: 把 cell_centroids
+    # 坐标 (config.yaml: resolution.original 分辨率) 缩放到 resample.tif 显示
+    # 空间 (config.yaml: resolution.resampled 分辨率, 与 p5 atlas 分辨率一致)。
+    # 与最终 atlas 文件本身无关 -- Atlas/Stats 模式下的坐标已经是 atlas 体素空间，不需要缩放。
+    "res_original":  np.array([0.65, 0.65, 8.0]),
+    "res_resampled": np.array([20.0, 20.0, 20.0]), # matches resample.tif / p5 atlas resolution
 
-    # 6. 类别名称映射
-    "labels_to_names": {
-        0: "red glia", 1: "green glia", 2: "yellow glia",
-        3: "red neuron", 4: "green neuron", 5: "yellow neuron"
-    },
-    
-    # 7. 细胞形状映射
-    "class_symbols": {
-        0: 'disc', 1: 'square', 2: 'triangle_up', 
-        3: 'triangle_down', 4: 'star', 5: 'cross'
-    }
+    # 6. cell_centroids 文件前缀 (native 模式下, ob_<class_name>.csv)
+    "cell_prefix": "ob_",
 }
 
-# ================= 🧠 1. JSON 脑区层级管理器 =================
-class OntologyManager:
-    def __init__(self, json_path):
-        self.id_to_name = {}
-        self.name_to_id = {}
-        if json_path and os.path.exists(json_path):
-            self.parse_ontology(json_path)
+# ================= 🧠 1. 脑区层级管理器 (基于 ClearMap.Alignment.Annotation) =================
+class OntologyTree:
+    """Self-contained Allen CCF ontology parser -- no ClearMap package import,
+    so this interactive viewer can keep running in a lightweight napari/PyQt5
+    environment (ClearMap itself pulls in heavy, environment-specific deps
+    like graph_tool/elastix that this process shouldn't need). Tracks id,
+    name, graph_order, tree level (depth from root) and parent id per node.
 
-    def parse_ontology(self, json_path):
-        print(f"📖 Parsing JSON Ontology...")
+    Note: raw Allen atlas ids (.mhd/atlas volumes) and ClearMap graph_order
+    values (cell_registration.csv's id column) are two different numbering
+    systems that can collide numerically for different nodes -- use
+    get_name() for the former and get_name_by_graph_order() for the latter.
+    """
+    def __init__(self, json_path=None):
+        self.id_to_name = {}
+        self.graph_order_to_name = {}
+        self.name_to_id = {}
+        self.id_to_level = {}
+        self.id_to_parent = {}
+        self.max_level = 0
+        if json_path and os.path.exists(json_path):
+            self._parse(json_path)
+
+    def _parse(self, json_path):
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
-        def extract_node(node):
-            if isinstance(node, list):
-                for item in node: extract_node(item)
-                return
-            if isinstance(node, dict):
-                node_id = node.get('id') or node.get('structure_id')
-                graph_order = node.get('graph_order') 
-                node_name = node.get('name') or node.get('safe_name') or node.get('acronym')
-                
-                if node_name is not None:
-                    s_name = DataLoader.clean_part(node_name)
-                    if graph_order is not None:
-                        self.id_to_name[int(graph_order)] = s_name
-                        self.name_to_id[s_name] = int(graph_order)
-                    if node_id is not None:
-                        self.id_to_name[int(node_id)] = s_name
-                        if s_name not in self.name_to_id:
-                            self.name_to_id[s_name] = int(node_id)
-                
-                children = node.get('children') or node.get('msg')
-                if children: extract_node(children)
-        
-        if isinstance(data, dict):
-            if 'msg' in data: extract_node(data['msg'])
-            elif 'children' in data: extract_node(data['children'])
-            else: extract_node(data)
-        elif isinstance(data, list):
-            extract_node(data)
 
-    def get_name(self, region_id):
-        return self.id_to_name.get(region_id, f"Region {region_id}")
+        root = None
+        if isinstance(data, dict):
+            if 'msg' in data:
+                msg = data['msg']
+                root = msg[0] if isinstance(msg, list) else msg
+            elif 'children' in data:
+                root = data
+        elif isinstance(data, list) and data:
+            root = data[0]
+        if root is None:
+            return
+
+        def walk(node, level, parent_id):
+            node_id = node.get('id') or node.get('structure_id')
+            graph_order = node.get('graph_order')
+            name = node.get('name') or node.get('safe_name') or node.get('acronym')
+            if name is not None:
+                s_name = DataLoader.clean_part(name)
+                if node_id is not None:
+                    node_id = int(node_id)
+                    self.id_to_name[node_id] = s_name
+                    if s_name not in self.name_to_id:
+                        self.name_to_id[s_name] = node_id
+                    self.id_to_level[node_id] = level
+                    self.id_to_parent[node_id] = parent_id
+                if graph_order is not None:
+                    self.graph_order_to_name[int(graph_order)] = s_name
+                    if s_name not in self.name_to_id:
+                        self.name_to_id[s_name] = int(graph_order)
+            self.max_level = max(self.max_level, level)
+            for child in (node.get('children') or []):
+                walk(child, level + 1, node_id)
+
+        walk(root, 0, None)
+
+    def get_name(self, region_value):
+        """Id-based lookup (used for raw atlas-volume ids: .mhd/.tif voxel
+        values, hover/click). NOTE: a graph_order value can numerically
+        collide with a *different* node's raw id -- use get_name_by_graph_order
+        for values coming from cell_registration.csv's graph_order column."""
+        try:
+            return self.id_to_name.get(int(region_value), f"Region {region_value}")
+        except (TypeError, ValueError):
+            return f"Region {region_value}"
+
+    def get_name_by_graph_order(self, graph_order_value):
+        try:
+            return self.graph_order_to_name.get(int(graph_order_value), f"Region {graph_order_value}")
+        except (TypeError, ValueError):
+            return f"Region {graph_order_value}"
+
+    def level_of_id(self, region_id):
+        return self.id_to_level.get(int(region_id))
+
+    def ancestor_id_at_level(self, region_id, level):
+        """Walk up the parent chain until at or above `level` (a shallower
+        node just maps to itself -- mirrors how a chosen level's stats are
+        painted onto a deeper-resolution atlas)."""
+        rid = int(region_id)
+        while self.id_to_level.get(rid, 0) > level:
+            parent = self.id_to_parent.get(rid)
+            if parent is None: break
+            rid = parent
+        return rid
+
+    def ancestor_ids_at_level(self, ids_array, level):
+        return np.array([self.ancestor_id_at_level(i, level) for i in ids_array], dtype=int)
 
 # ================= 📂 2. 数据加载与处理 =================
 class DataLoader:
@@ -106,20 +150,81 @@ class DataLoader:
         for entry in os.scandir(parent_dir):
             if not entry.is_dir(): continue
             name = entry.name
-            group = 'Experimental (FF)' if name.startswith('ff') else ('Control (FW)' if name.startswith('fw') else None)
-            if not group: continue
-            
+
             res_path = os.path.join(entry.path, 'resampled.tif')
             mhd_path = os.path.join(entry.path, 'volume', 'result.mhd')
-            
+
             if os.path.exists(res_path):
                 samples[name] = {
-                    'path': entry.path, 'group': group,
+                    'path': entry.path,
                     'resampled': res_path, 'mhd': mhd_path,
                     'cell_dir_raw': os.path.join(entry.path, 'cell_centroids'),
-                    'cell_dir_reg': os.path.join(entry.path, 'cell registration')
+                    'cell_dir_reg': os.path.join(entry.path, 'cell_registration')
                 }
         return samples
+
+    @staticmethod
+    def normalize_class_key(name):
+        """Token-set key for fuzzy class matching: lowercase, split on
+        non-alphanumerics, drop pure-numeric tokens (batch/version markers
+        like the '3' in 'glia_3_GFP') so naming drift across samples -- e.g.
+        'glia_3_GFP' vs 'glia_GFP' -- still resolves to the same class."""
+        tokens = re.split(r'[^a-zA-Z0-9]+', name)
+        return frozenset(t.lower() for t in tokens if t and not t.isdigit())
+
+    @staticmethod
+    def discover_classes(samples):
+        """Union of cell_registration/<class_name>/ subfolder names across all
+        scanned samples -- cell classes are now arbitrary marker-combination
+        names (e.g. 'glia_3_GFP'), not a fixed enum. Names are grouped by
+        normalize_class_key so differently-named variants of the same marker
+        combination on different samples (e.g. 'glia_3_GFP' vs 'glia_GFP')
+        collapse into a single class instead of appearing as two."""
+        all_names = set()
+        for info in samples.values():
+            reg_dir = info.get('cell_dir_reg')
+            if reg_dir and os.path.isdir(reg_dir):
+                all_names.update(d for d in os.listdir(reg_dir) if os.path.isdir(os.path.join(reg_dir, d)))
+
+        groups = {}
+        for name in sorted(all_names):
+            groups.setdefault(DataLoader.normalize_class_key(name), []).append(name)
+        canonical = [min(names, key=lambda n: (len(n), n)) for names in groups.values()]
+        return sorted(canonical)
+
+    @staticmethod
+    def resolve_class_dir(reg_dir, class_name):
+        """Find the actual cell_registration/<...> subfolder for `class_name`
+        within one sample, tolerating naming drift (see normalize_class_key).
+        Returns None if no folder matches."""
+        if not os.path.isdir(reg_dir):
+            return None
+        actual = [d for d in os.listdir(reg_dir) if os.path.isdir(os.path.join(reg_dir, d))]
+        if class_name in actual:
+            return class_name
+        key = DataLoader.normalize_class_key(class_name)
+        matches = [d for d in actual if DataLoader.normalize_class_key(d) == key]
+        return matches[0] if matches else None
+
+    @staticmethod
+    def resolve_class_file(folder_path, class_name, prefix, suffix='.csv'):
+        """Find the actual '<prefix><...><suffix>' file for `class_name`
+        within one sample's cell_centroids folder (native mode uses flat
+        files, not subfolders), tolerating naming drift. Returns None if no
+        file matches."""
+        if not os.path.isdir(folder_path):
+            return None
+        exact = f"{prefix}{class_name}{suffix}"
+        if os.path.exists(os.path.join(folder_path, exact)):
+            return exact
+        key = DataLoader.normalize_class_key(class_name)
+        matches = []
+        for fname in os.listdir(folder_path):
+            if fname.startswith(prefix) and fname.endswith(suffix):
+                stem = fname[len(prefix):-len(suffix)] if suffix else fname[len(prefix):]
+                if DataLoader.normalize_class_key(stem) == key:
+                    matches.append(fname)
+        return matches[0] if matches else None
 
     @staticmethod
     def load_mhd(path):
@@ -135,14 +240,15 @@ class DataLoader:
         return ((img_clipped - low) / (high - low) * 255).astype(np.uint8), img.shape
 
     @staticmethod
-    def load_cells_native_df(folder_path, raw_res, target_res, mhd_data, ontology):
+    def load_cells_native_df(folder_path, raw_res, target_res, mhd_data, ontology, class_names):
         all_dfs = []
-        scale_factor = raw_res / target_res 
+        scale_factor = raw_res / target_res
         mhd_shape = mhd_data.shape if mhd_data is not None else (0,0,0)
 
-        for i, class_name in CONFIG['labels_to_names'].items():
-            csv_path = os.path.join(folder_path, f'ob_{i}.csv')
-            if os.path.exists(csv_path):
+        for class_name in class_names:
+            fname = DataLoader.resolve_class_file(folder_path, class_name, CONFIG['cell_prefix'])
+            csv_path = os.path.join(folder_path, fname) if fname else None
+            if csv_path and os.path.exists(csv_path):
                 df = pd.read_csv(csv_path, header=None)
                 if len(df) == 0: continue
                 napari_pts = (df.values * scale_factor)[:, [2, 1, 0]] 
@@ -163,72 +269,49 @@ class DataLoader:
         return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
     @staticmethod
-    def load_cells_atlas_df(folder_path, ontology):
+    def load_cells_atlas_df(folder_path, ontology, class_names):
         all_dfs = []
-        for i, class_name in CONFIG['labels_to_names'].items():
-            csv_path = os.path.join(folder_path, str(i), 'cell_registration.csv')
-            if os.path.exists(csv_path):
+        for class_name in class_names:
+            actual_dir = DataLoader.resolve_class_dir(folder_path, class_name)
+            csv_path = os.path.join(folder_path, actual_dir, 'cell_registration.csv') if actual_dir else None
+            if csv_path and os.path.exists(csv_path):
                 try:
+                    # cell_registration.csv columns (no header): x,y,z, xr,yr,zr
+                    # (resampled-space, pre-elastix), xt,yt,zt (atlas-space,
+                    # post-elastix), graph_order, name.
                     df_raw = pd.read_csv(csv_path, header=None, names=range(20), engine='python')
                     if len(df_raw) > 0:
-                        coords = df_raw.iloc[:, 3:6].values.astype(float)
+                        coords = df_raw.iloc[:, 6:9].values.astype(float)
                         valid_mask = ~np.isnan(coords).any(axis=1)
                         coords = coords[valid_mask]
 
-                        ids = df_raw.iloc[:, 6].values[valid_mask]
+                        ids = df_raw.iloc[:, 9].values[valid_mask]  # graph_order, not raw atlas id
                         ids = pd.to_numeric(pd.Series(ids), errors='coerce').fillna(0).astype(int).values
 
                         napari_pts = coords[:, [2, 1, 0]]
-                        
+
                         df_clean = pd.DataFrame(napari_pts, columns=['z', 'y', 'x'])
                         df_clean['class_name'] = class_name
                         df_clean['mapped_id'] = ids
-                        df_clean['region'] = [ontology.get_name(uid) for uid in ids]
+                        df_clean['region'] = [ontology.get_name_by_graph_order(uid) for uid in ids]
                         all_dfs.append(df_clean)
                 except Exception as e:
                     print(f"❌ 解析 '{class_name}' 坐标出错: {e}")
         return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
     @staticmethod
-    def load_stats(excel_path):
-        full_stats = {name: {} for name in CONFIG['labels_to_names'].values()}
-        full_stats["Volume"] = {}
-        if not excel_path or not os.path.exists(excel_path): return full_stats
+    def load_stats(long_table_path):
+        """Loads the tidy long-format CSV produced by stats_group_compare.py
+        (columns include: level, id, name, class_name, metric, fold_change,
+        log2fc, p_value, p_fdr, ...). Returns the raw DataFrame -- filtering by
+        class/metric/level happens in refresh_heatmaps()."""
+        if not long_table_path or not os.path.exists(long_table_path):
+            return pd.DataFrame()
         try:
-            xls = pd.read_excel(excel_path, sheet_name=None, engine='openpyxl')
-            for sheet_name, df in xls.items():
-                clean_sheet = sheet_name.strip().lower().replace(" ", "_")
-                metric_type = "Unknown"
-                if "cnt" in clean_sheet or "count" in clean_sheet: metric_type = "Count"
-                elif "den" in clean_sheet: metric_type = "Density"
-                elif "pct" in clean_sheet or "percent" in clean_sheet: metric_type = "Percentage"
-                elif "vol" in clean_sheet: metric_type = "Volume"
-                
-                target_class = "Volume" if metric_type == "Volume" else next(
-                    (v for k, v in CONFIG['labels_to_names'].items() if v.strip().lower().replace(" ", "_") in clean_sheet), None)
-                if not target_class: continue
-                
-                cols = {str(c).lower(): c for c in df.columns}
-                c_id, c_fc, c_p_raw, c_p_fdr = [
-                    next((cols[c] for c in cols if any(k in c for k in kw)), None) 
-                    for kw in [['id', 'region_id'], ['fc'], ['p_val', 'pvalue'], ['fdr', 'q_val']]
-                ]
-                if not c_id: continue
-
-                sheet_stats = {}
-                for _, row in df.iterrows():
-                    if pd.isna(row[c_id]): continue
-                    try: 
-                        rid = int(row[c_id])
-                        sheet_stats[rid] = {
-                            'FC': float(row[c_fc]) if c_fc and not pd.isna(row[c_fc]) else 0,
-                            'P_Raw': -np.log10(float(row[c_p_raw]) + 1e-20) if c_p_raw and not pd.isna(row[c_p_raw]) else 0,
-                            'P_FDR': -np.log10(float(row[c_p_fdr]) + 1e-20) if c_p_fdr and not pd.isna(row[c_p_fdr]) else 0
-                        }
-                    except ValueError: continue
-                full_stats[target_class][metric_type] = sheet_stats
-        except Exception as e: print(f"❌ Excel Error: {e}")
-        return full_stats
+            return pd.read_csv(long_table_path)
+        except Exception as e:
+            print(f"❌ Stats table error: {e}")
+            return pd.DataFrame()
 
 # ================= 🎮 3. 主控制器 =================
 class MainController:
@@ -238,17 +321,21 @@ class MainController:
         # 初始状态为空，等待用户点击加载
         self.ontology = None
         self.samples = {}
-        self.all_stats = {}
-        
+        self.classes = []
+        self.all_stats_df = pd.DataFrame()
+
         self.current_atlas_labels = None
-        self.current_cells_df = pd.DataFrame() 
+        self.current_cells_df = pd.DataFrame()
         self.highlight_atlas = None
         self.highlight_cells = None
         self.last_hover_val = -1
-        
+        self._atlas_unique_ids = None
+        self._atlas_inverse = None
+
         self.mode = "Stats"
-        self.current_class = CONFIG['labels_to_names'][0]
+        self.current_class = None
         self.current_metric = "Count"
+        self.current_level = 0
         self.cell_checkboxes = {}
         self.last_search_mode = "Exact"
 
@@ -273,18 +360,19 @@ class MainController:
         for uid in df_cells['mapped_id'].unique():
             if uid != 0: id_color_map[uid] = labels_layer.get_color(uid)
 
-        for class_idx, cls_name in CONFIG['labels_to_names'].items():
+        for cls_name in self.classes:
             sub_df = df_cells[df_cells['class_name'] == cls_name]
             if len(sub_df) > 0:
                 coords = sub_df[['z', 'y', 'x']].values
                 colors = np.array([id_color_map[uid] for uid in sub_df['mapped_id']])
                 is_vis = self.cell_checkboxes[cls_name].isChecked()
-                
-                symbol = CONFIG['class_symbols'].get(class_idx, 'disc')
-                
+
+                # One layer per discovered cell class -- napari's default
+                # per-layer face-color cycling distinguishes layers, no
+                # per-class symbol/shape mapping needed.
                 layer = self.viewer.add_points(
                     coords, name=f"Cell: {cls_name}", face_color=colors,
-                    symbol=symbol, size=self.spin_point_size.value(), border_width=0, blending='translucent', visible=is_vis
+                    symbol='disc', size=self.spin_point_size.value(), border_width=0, blending='translucent', visible=is_vis
                 )
                 layer.features = pd.DataFrame({'Region': sub_df['region'].values})
                 layer.events.highlight.connect(self.on_cell_layer_click)
@@ -344,6 +432,7 @@ class MainController:
         if atlas_path and os.path.exists(atlas_path):
             data = tifffile.imread(atlas_path) if atlas_path.lower().endswith(('.tif', '.tiff')) else __import__('nrrd').read(atlas_path)[0]
             self.current_atlas_labels = data.astype(np.uint32)
+            self._atlas_unique_ids, self._atlas_inverse = None, None
             self.viewer.add_labels(self.current_atlas_labels, name="Atlas Anatomy", opacity=0.1)
             self.setup_highlight_layers(self.current_atlas_labels.shape)
             self.refresh_heatmaps()
@@ -361,10 +450,11 @@ class MainController:
         labels_layer = None
         if mhd is not None:
             self.current_atlas_labels = mhd
+            self._atlas_unique_ids, self._atlas_inverse = None, None
             labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.05, visible=False)
             self.setup_highlight_layers(mhd.shape)
 
-        df_cells = DataLoader.load_cells_native_df(s['cell_dir_raw'], CONFIG['res_raw'], CONFIG['res_atlas'], mhd, self.ontology)
+        df_cells = DataLoader.load_cells_native_df(s['cell_dir_raw'], CONFIG['res_original'], CONFIG['res_resampled'], mhd, self.ontology, self.classes)
         self.current_cells_df = df_cells
         self.render_cells_from_df(df_cells, labels_layer)
 
@@ -379,10 +469,11 @@ class MainController:
         if atlas_path and os.path.exists(atlas_path):
             data = tifffile.imread(atlas_path) if atlas_path.lower().endswith(('.tif', '.tiff')) else __import__('nrrd').read(atlas_path)[0]
             self.current_atlas_labels = data.astype(np.uint32)
+            self._atlas_unique_ids, self._atlas_inverse = None, None
             atlas_layer = self.viewer.add_labels(self.current_atlas_labels, name="Atlas Anatomy", opacity=0.3)
             self.setup_highlight_layers(self.current_atlas_labels.shape)
         
-        df_cells = DataLoader.load_cells_atlas_df(s['cell_dir_reg'], self.ontology)
+        df_cells = DataLoader.load_cells_atlas_df(s['cell_dir_reg'], self.ontology, self.classes)
         self.current_cells_df = df_cells
         self.render_cells_from_df(df_cells, atlas_layer)
 
@@ -397,25 +488,50 @@ class MainController:
             layer.selected_data = set() 
 
     def refresh_heatmaps(self):
-        if self.mode != "Stats" or self.current_atlas_labels is None: return 
+        if self.mode != "Stats" or self.current_atlas_labels is None: return
         for layer in list(self.viewer.layers):
             if "Stats:" in layer.name: self.viewer.layers.remove(layer)
 
-        metric_stats = self.all_stats.get(self.current_class, {}).get(self.current_metric, {})
-        if not metric_stats: return
+        if self.all_stats_df.empty or not self.current_class:
+            return
 
-        max_id = int(self.current_atlas_labels.max())
-        lut_raw, lut_fdr = np.zeros(max_id + 1), np.zeros(max_id + 1)
-        
-        for rid, s in metric_stats.items():
-            if rid > max_id: continue
-            val = np.log2(s.get('FC', 0) + 1e-9) if s.get('FC', 0) > 0 else s.get('FC', 0)
-            if s.get('P_Raw', 0) >= 1.3: lut_raw[rid] = val
-            if s.get('P_FDR', 0) >= 1.3: lut_fdr[rid] = val
+        sub = self.all_stats_df[
+            (self.all_stats_df['class_name'] == self.current_class) &
+            (self.all_stats_df['metric'] == self.current_metric) &
+            (self.all_stats_df['level'] == self.current_level)
+        ]
+        if sub.empty:
+            self.viewer.status = f"No stats for {self.current_class} / {self.current_metric} / level {self.current_level}"
+            return
+
+        # Atlas is always stored at full (leaf) resolution; a chosen level's
+        # region ids are ancestors of those leaf ids. Decompose the volume into
+        # its (small) set of unique ids once, then only recompute the
+        # level-ancestor lookup (cheap) when class/metric/level change.
+        if self._atlas_unique_ids is None:
+            self._atlas_unique_ids, self._atlas_inverse = np.unique(self.current_atlas_labels, return_inverse=True)
+        ancestor_ids = self.ontology.ancestor_ids_at_level(self._atlas_unique_ids, self.current_level)
+
+        log2fc_by_id = dict(zip(sub['id'], sub['log2fc'].fillna(0.0)))
+        p_by_id = dict(zip(sub['id'], sub['p_value']))
+        p_fdr_by_id = dict(zip(sub['id'], sub['p_fdr']))
+
+        vals_raw = np.zeros(len(self._atlas_unique_ids))
+        vals_fdr = np.zeros(len(self._atlas_unique_ids))
+        for i, aid in enumerate(ancestor_ids):
+            aid = int(aid)
+            val = log2fc_by_id.get(aid)
+            if val is None: continue
+            if p_by_id.get(aid, 1.0) <= 0.05: vals_raw[i] = val
+            if p_fdr_by_id.get(aid, 1.0) <= 0.05: vals_fdr[i] = val
+
+        lut_raw_image = vals_raw[self._atlas_inverse].reshape(self.current_atlas_labels.shape)
+        lut_fdr_image = vals_fdr[self._atlas_inverse].reshape(self.current_atlas_labels.shape)
 
         dark_cmap = self.get_dark_colormap()
-        self.viewer.add_image(lut_raw[self.current_atlas_labels], name=f"Stats: {self.current_metric} (Raw P)", colormap=dark_cmap, contrast_limits=[-2,2], blending='additive', visible=True)
-        self.viewer.add_image(lut_fdr[self.current_atlas_labels], name=f"Stats: {self.current_metric} (FDR)", colormap=dark_cmap, contrast_limits=[-2,2], blending='additive', visible=False)
+        level_tag = f"L{self.current_level:02d}"
+        self.viewer.add_image(lut_raw_image, name=f"Stats: {self.current_metric} {level_tag} (Raw P)", colormap=dark_cmap, contrast_limits=[-2,2], blending='additive', visible=True)
+        self.viewer.add_image(lut_fdr_image, name=f"Stats: {self.current_metric} {level_tag} (FDR)", colormap=dark_cmap, contrast_limits=[-2,2], blending='additive', visible=False)
 
     def setup_callbacks(self):
         @self.viewer.mouse_move_callbacks.append
@@ -475,12 +591,12 @@ class MainController:
             return h, line, btn
 
         r1, self.line_dir, btn_dir = create_path_row("Samples Dir:")
-        r2, self.line_excel, btn_excel = create_path_row("Stats Excel:")
+        r2, self.line_stats, btn_stats = create_path_row("Stats Table (CSV):")
         r3, self.line_atlas, btn_atlas = create_path_row("Atlas (.tif):")
         r4, self.line_json, btn_json = create_path_row("Ontology JSON:")
 
         btn_dir.clicked.connect(lambda: self.line_dir.setText(QFileDialog.getExistingDirectory(dock, "Select Samples Directory")))
-        btn_excel.clicked.connect(lambda: self.line_excel.setText(QFileDialog.getOpenFileName(dock, "Select Excel", "", "Excel Files (*.xlsx)")[0]))
+        btn_stats.clicked.connect(lambda: self.line_stats.setText(QFileDialog.getOpenFileName(dock, "Select Stats Table", "", "CSV Files (*.csv)")[0]))
         btn_atlas.clicked.connect(lambda: self.line_atlas.setText(QFileDialog.getOpenFileName(dock, "Select Atlas", "", "Image Files (*.tif *.nrrd)")[0]))
         btn_json.clicked.connect(lambda: self.line_json.setText(QFileDialog.getOpenFileName(dock, "Select Ontology", "", "JSON Files (*.json)")[0]))
 
@@ -534,33 +650,35 @@ class MainController:
 
         layout.addWidget(QLabel("<b>2. Cell Class:</b>"))
         self.class_stack = QStackedWidget()
-        
+
+        # Stats mode: single class selector, populated dynamically once the
+        # cell classes (marker combinations) are discovered from the data.
         page_stats = QWidget(); layout_stats = QVBoxLayout(page_stats); layout_stats.setContentsMargins(0,0,0,0)
         self.combo_class_single = QComboBox()
-        for _, name in CONFIG['labels_to_names'].items(): self.combo_class_single.addItem(name)
-        self.combo_class_single.addItem("Volume")
         self.combo_class_single.currentTextChanged.connect(self.on_class_single_change)
         layout_stats.addWidget(self.combo_class_single)
         self.class_stack.addWidget(page_stats)
-        
-        page_sample = QWidget(); layout_sample = QVBoxLayout(page_sample); layout_sample.setContentsMargins(0,0,0,0)
-        shape_icon_map = {'disc': '●', 'square': '■', 'triangle_up': '▲', 'triangle_down': '▼', 'star': '★', 'cross': '✚'}
-        for i, name in CONFIG['labels_to_names'].items():
-            icon = shape_icon_map.get(CONFIG['class_symbols'].get(i, 'disc'), '●')
-            cb = QCheckBox(f"{icon} {name}")
-            cb.setChecked(True) 
-            cb.stateChanged.connect(lambda state, n=name: self.on_cell_check_toggle(n, state))
-            layout_sample.addWidget(cb)
-            self.cell_checkboxes[name] = cb
-            
+
+        # Sample view mode: one checkbox per discovered cell class (no
+        # symbol/shape mapping -- each class is just its own napari layer).
+        # Populated dynamically in process_loaded_data(); container kept so it
+        # can be cleared and rebuilt when data is (re)loaded.
+        page_sample = QWidget()
+        self.layout_sample_checkboxes = QVBoxLayout(page_sample)
+        self.layout_sample_checkboxes.setContentsMargins(0,0,0,0)
         self.class_stack.addWidget(page_sample)
         layout.addWidget(self.class_stack); layout.addSpacing(10)
-        
+
         layout.addWidget(QLabel("<b>3. Metric Type (Stats Only):</b>"))
         self.combo_metric = QComboBox()
-        self.combo_metric.addItems(["Count", "Density", "Percentage", "Volume"])
+        self.combo_metric.addItems(["Count", "Percentage", "Density"])
         self.combo_metric.currentTextChanged.connect(self.on_metric_change)
         layout.addWidget(self.combo_metric)
+
+        layout.addWidget(QLabel("<b>4. Ontology Level (Stats Only):</b>"))
+        self.combo_level = QComboBox()
+        self.combo_level.currentTextChanged.connect(self.on_level_change)
+        layout.addWidget(self.combo_level)
 
         layout.addSpacing(10); layout.addWidget(QLabel("<b>🧮 Log2 FoldChange:</b>"))
         
@@ -582,41 +700,80 @@ class MainController:
     # --- 新增：处理用户点击“加载数据”按钮的逻辑 ---
     def process_loaded_data(self):
         CONFIG['parent_data_dir'] = self.line_dir.text().strip()
-        CONFIG['stats_excel'] = self.line_excel.text().strip()
+        CONFIG['stats_long_table'] = self.line_stats.text().strip()
         CONFIG['std_atlas_path'] = self.line_atlas.text().strip()
         CONFIG['ontology_json_path'] = self.line_json.text().strip()
-        
+
         if not CONFIG['std_atlas_path'] or not CONFIG['ontology_json_path']:
             QMessageBox.warning(None, "Missing Files", "Atlas (.tif) 和 Ontology JSON 是必填项！\n请先选择这两个基础文件。")
             return
-            
+
         self.viewer.status = "⏳ Loading Data... Please wait."
-        
+
         # 重新加载数据
-        self.ontology = OntologyManager(CONFIG['ontology_json_path'])
+        self.ontology = OntologyTree(CONFIG['ontology_json_path'])
         self.samples = DataLoader.scan_samples(CONFIG['parent_data_dir'])
-        self.all_stats = DataLoader.load_stats(CONFIG['stats_excel'])
+        self.classes = DataLoader.discover_classes(self.samples)
+        self.all_stats_df = DataLoader.load_stats(CONFIG['stats_long_table'])
+
+        self._rebuild_class_checkboxes()
+        self._rebuild_class_combo()
+        self._rebuild_level_combo()
 
         # 更新下拉菜单
         self.combo_sample.blockSignals(True) # 暂时屏蔽信号防止触发错误渲染
         self.combo_sample.clear()
-        
-        if self.all_stats and "Volume" in self.all_stats:
+
+        if not self.all_stats_df.empty:
             self.combo_sample.addItem("📊 Statistical Analysis")
-            
-        for name, info in self.samples.items():
-            self.combo_sample.addItem(f"🐭 [Native] {info['group']}: {name}")
-            self.combo_sample.addItem(f"📍 [Atlas ] {info['group']}: {name}")
-            
+
+        for name in self.samples:
+            self.combo_sample.addItem(f"🐭 [Native] {name}")
+            self.combo_sample.addItem(f"📍 [Atlas ] {name}")
+
         if self.combo_sample.count() == 0:
             self.combo_sample.addItem("未找到有效数据")
             QMessageBox.information(None, "Info", "未在指定文件夹中扫描到有效的样本数据。")
         else:
             self.combo_sample.setCurrentIndex(0)
             self.on_mode_change(self.combo_sample.currentText()) # 手动触发第一次渲染
-            
+
         self.combo_sample.blockSignals(False)
         self.viewer.status = "✅ Data loaded successfully."
+
+    def _rebuild_class_checkboxes(self):
+        """(Re)build one checkbox per discovered cell class in Sample-view mode."""
+        while self.layout_sample_checkboxes.count():
+            item = self.layout_sample_checkboxes.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self.cell_checkboxes = {}
+        for name in self.classes:
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            cb.stateChanged.connect(lambda state, n=name: self.on_cell_check_toggle(n, state))
+            self.layout_sample_checkboxes.addWidget(cb)
+            self.cell_checkboxes[name] = cb
+
+    def _rebuild_class_combo(self):
+        self.combo_class_single.blockSignals(True)
+        self.combo_class_single.clear()
+        self.combo_class_single.addItems(self.classes)
+        self.combo_class_single.blockSignals(False)
+        self.current_class = self.classes[0] if self.classes else None
+
+    def _rebuild_level_combo(self):
+        self.combo_level.blockSignals(True)
+        self.combo_level.clear()
+        if not self.all_stats_df.empty:
+            levels = sorted(int(l) for l in self.all_stats_df['level'].unique())
+        elif self.ontology is not None:
+            levels = list(range(self.ontology.max_level + 1))
+        else:
+            levels = []
+        for lvl in levels:
+            self.combo_level.addItem(str(lvl))
+        self.combo_level.blockSignals(False)
+        self.current_level = levels[0] if levels else 0
 
     # 下方保留原有的事件处理函数
     def on_point_size_change(self, val):
@@ -635,18 +792,21 @@ class MainController:
         else:
             self.class_stack.setCurrentIndex(1)
             self.combo_metric.setEnabled(False)
-            sample_name = text.split(": ")[1]
+            sample_name = text.split('] ', 1)[1]
             if "[Native]" in text:
                 self.mode = "Native"
                 self.load_sample_native_view(sample_name)
             elif "[Atlas ]" in text:
                 self.mode = "Atlas_Sample"
                 self.load_sample_atlas_view(sample_name)
-    
+
     def on_class_single_change(self, text):
         self.current_class = text
-        if text == "Volume": self.combo_metric.setCurrentText("Volume")
-        elif self.combo_metric.currentText() == "Volume": self.combo_metric.setCurrentText("Count")
+        self.refresh_heatmaps()
+
+    def on_level_change(self, text):
+        if not text: return
+        self.current_level = int(text)
         self.refresh_heatmaps()
 
     def on_cell_check_toggle(self, name, state):
