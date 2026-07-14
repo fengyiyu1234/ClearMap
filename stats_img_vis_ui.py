@@ -23,7 +23,10 @@ from napari.utils.colormaps import Colormap
 CONFIG = {
     # 路径默认留空，由用户在 UI 中自行选择
     "parent_data_dir": "",
-    "stats_long_table": "",   # region_stats.csv produced by stats_group_compare.py
+    # region_stats_by_level.xlsx produced by stats_group_compare.py: one
+    # sheet per ontology level (L00, L01, ...) plus ReadMe/Region_Volumes
+    # reference sheets. Pre-filled as default but still user-editable via UI.
+    "stats_long_table": "/data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/stats/region_stats_by_level.xlsx",
     "std_atlas_path": "",
     "ontology_json_path": "",
 
@@ -301,13 +304,23 @@ class DataLoader:
 
     @staticmethod
     def load_stats(long_table_path):
-        """Loads the tidy long-format CSV produced by stats_group_compare.py
-        (columns include: level, id, name, class_name, metric, fold_change,
-        log2fc, p_value, p_fdr, ...). Returns the raw DataFrame -- filtering by
-        class/metric/level happens in refresh_heatmaps()."""
+        """Loads region-level stats produced by stats_group_compare.py.
+        Supports the tidy long-format CSV (region_stats.csv) as well as the
+        by-level workbook (region_stats_by_level.xlsx), which splits the same
+        long table across one sheet per ontology level (L00, L01, ...) plus
+        'ReadMe'/'Region_Volumes' reference sheets that hold no stats rows and
+        are skipped. Columns include: level, id, name, class_name, metric,
+        fold_change, log2fc, p_value, p_fdr, ... Returns the concatenated
+        DataFrame -- filtering by class/metric/level happens in
+        refresh_heatmaps()."""
         if not long_table_path or not os.path.exists(long_table_path):
             return pd.DataFrame()
         try:
+            if long_table_path.lower().endswith(('.xlsx', '.xls')):
+                xls = pd.ExcelFile(long_table_path)
+                level_sheets = [s for s in xls.sheet_names if re.fullmatch(r'L\d+', s)]
+                dfs = [xls.parse(s) for s in level_sheets]
+                return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
             return pd.read_csv(long_table_path)
         except Exception as e:
             print(f"❌ Stats table error: {e}")
@@ -580,23 +593,24 @@ class MainController:
         layout_data = QVBoxLayout(group_data)
         
         # Helper 函数创建带按钮的行
-        def create_path_row(label, is_dir=False):
+        def create_path_row(label, initial_text=""):
             h = QHBoxLayout()
             h.addWidget(QLabel(label))
             btn = QPushButton("Browse")
             line = QLineEdit()
+            line.setText(initial_text)
             line.setReadOnly(True)
             h.addWidget(line)
             h.addWidget(btn)
             return h, line, btn
 
         r1, self.line_dir, btn_dir = create_path_row("Samples Dir:")
-        r2, self.line_stats, btn_stats = create_path_row("Stats Table (CSV):")
+        r2, self.line_stats, btn_stats = create_path_row("Stats Table (xlsx/csv):", CONFIG['stats_long_table'])
         r3, self.line_atlas, btn_atlas = create_path_row("Atlas (.tif):")
         r4, self.line_json, btn_json = create_path_row("Ontology JSON:")
 
         btn_dir.clicked.connect(lambda: self.line_dir.setText(QFileDialog.getExistingDirectory(dock, "Select Samples Directory")))
-        btn_stats.clicked.connect(lambda: self.line_stats.setText(QFileDialog.getOpenFileName(dock, "Select Stats Table", "", "CSV Files (*.csv)")[0]))
+        btn_stats.clicked.connect(lambda: self.line_stats.setText(QFileDialog.getOpenFileName(dock, "Select Stats Table", "", "Excel/CSV Files (*.xlsx *.xls *.csv)")[0]))
         btn_atlas.clicked.connect(lambda: self.line_atlas.setText(QFileDialog.getOpenFileName(dock, "Select Atlas", "", "Image Files (*.tif *.nrrd)")[0]))
         btn_json.clicked.connect(lambda: self.line_json.setText(QFileDialog.getOpenFileName(dock, "Select Ontology", "", "JSON Files (*.json)")[0]))
 
@@ -671,7 +685,7 @@ class MainController:
 
         layout.addWidget(QLabel("<b>3. Metric Type (Stats Only):</b>"))
         self.combo_metric = QComboBox()
-        self.combo_metric.addItems(["Count", "Percentage", "Density"])
+        self.combo_metric.addItems(["Count", "Percentage", "Density", "Volume"])
         self.combo_metric.currentTextChanged.connect(self.on_metric_change)
         layout.addWidget(self.combo_metric)
 
@@ -680,20 +694,23 @@ class MainController:
         self.combo_level.currentTextChanged.connect(self.on_level_change)
         layout.addWidget(self.combo_level)
 
-        layout.addSpacing(10); layout.addWidget(QLabel("<b>🧮 Log2 FoldChange:</b>"))
-        
-        fig = Figure(figsize=(0.8, 3.0), facecolor='#262930')
-        fig.subplots_adjust(left=0.1, right=0.4, bottom=0.05, top=0.95)
+        layout.addSpacing(6); layout.addWidget(QLabel("<b>🧮 Log2 FoldChange:</b>"))
+
+        # Horizontal, compact colorbar -- a tall vertical bar here used to eat
+        # a large chunk of the (width-capped) side panel's vertical space, at
+        # the expense of the Search Regions section above it.
+        fig = Figure(figsize=(3.0, 0.5), facecolor='#262930')
+        fig.subplots_adjust(left=0.05, right=0.95, bottom=0.45, top=0.95)
         ax = fig.add_subplot(111)
-        grad = np.linspace(2, -2, 256).reshape(-1, 1) 
+        grad = np.linspace(-2, 2, 256).reshape(1, -1)
         cmap_mpl = LinearSegmentedColormap.from_list("blue_black_red", ["blue", "black", "red"])
-        ax.imshow(grad, aspect='auto', cmap=cmap_mpl, extent=[0, 1, -2, 2])
-        ax.set_xticks([]); ax.yaxis.tick_right(); ax.tick_params(colors='white', labelsize=8)
+        ax.imshow(grad, aspect='auto', cmap=cmap_mpl, extent=[-2, 2, 0, 1])
+        ax.set_yticks([]); ax.xaxis.tick_bottom(); ax.tick_params(colors='white', labelsize=8)
+        for spine in ax.spines.values(): spine.set_color('white')
         canvas = FigureCanvasQTAgg(fig)
-        
-        h_leg = QHBoxLayout(); h_leg.addWidget(canvas, alignment=Qt.AlignLeft); h_leg.addStretch()
-        layout.addLayout(h_leg)
-        
+        canvas.setFixedHeight(48)
+
+        layout.addWidget(canvas)
         layout.addStretch()
         self.viewer.window.add_dock_widget(dock, area='right', name="Control Panel")
 
@@ -755,11 +772,18 @@ class MainController:
             self.cell_checkboxes[name] = cb
 
     def _rebuild_class_combo(self):
+        """Stats-mode class selector. Union of folder-discovered classes and
+        class_name values found in the loaded stats table, since merged
+        pseudo-classes (e.g. 'glia', 'gfp' from stats_group_compare.py's
+        merged_classes config) are summed at analysis time and have no
+        matching cell_registration/ folder of their own."""
         self.combo_class_single.blockSignals(True)
         self.combo_class_single.clear()
-        self.combo_class_single.addItems(self.classes)
+        stats_classes = set(self.all_stats_df['class_name'].unique()) if not self.all_stats_df.empty else set()
+        combined = sorted(set(self.classes) | stats_classes)
+        self.combo_class_single.addItems(combined)
         self.combo_class_single.blockSignals(False)
-        self.current_class = self.classes[0] if self.classes else None
+        self.current_class = combined[0] if combined else None
 
     def _rebuild_level_combo(self):
         self.combo_level.blockSignals(True)

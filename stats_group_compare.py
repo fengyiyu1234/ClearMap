@@ -2,8 +2,8 @@
 """
 Group comparison statistics across the CCF ontology hierarchy.
 
-Compares cell counts (Count / Percentage / Density) between two user-defined
-groups of samples, for every cell class found under each sample's
+Compares cell counts (Count / Percentage / Density / Volume) between two
+user-defined groups of samples, for every cell class found under each sample's
 `cell_registration/<class_name>/cell_registration.csv`, at every level of the
 Allen CCF ontology tree (root = level 0, finer subregions = higher levels).
 
@@ -26,9 +26,10 @@ from scipy import stats
 import ClearMap.Alignment.Annotation as ano
 from ClearMap.Analysis.Statistics.MultipleComparisonCorrection import correct_p_values
 from ClearMap.IO import IO as clearmap_io
+from ClearMap.IO import MHD as clearmap_mhd
 
 BACKGROUND_NAMES = {'background', 'no label', ''}
-METRICS = ('Count', 'Percentage', 'Density')
+METRICS = ('Count', 'Percentage', 'Density', 'Volume')
 
 
 # ================= Config =================
@@ -147,6 +148,98 @@ def discover_classes(data_dir, sample_names, explicit=None):
     return sorted(canonical)
 
 
+def compute_combined_categories(counts_df, totals_df, category_formulas, classes):
+    """Compute biologically-meaningful aggregate categories as a *signed*
+    (+/-) combination of existing classes, e.g.:
+        glia_total = glia_GFP + glia_RFP + glia_GFP_RFP + ...
+
+    Our marker-combination classes come from brain_detector's upstream
+    cross-channel matching (stitcher.py: match_soma_3d_iou + _merge_class,
+    annotate_soma_with_tf_containment), which greedily matches candidate
+    cells across marker channels via 3D IoU/containment and merges each
+    matched group into ONE row with ONE composite class label before the
+    per-class CSVs are written. So each physical cell lands in exactly one
+    class file -- these classes are mutually-exclusive partitions, not
+    nested/cumulative subsets -- and combining them is just a plain sum
+    (every term's sign is "+" in practice). The signed-term support exists
+    so this same engine still works correctly if some other dataset's
+    classes DO nest (where a "-" term would be needed to avoid double
+    counting); nothing here assumes one or the other.
+
+    category_formulas: dict name -> list of {"sign": "+"/"-", "class": name}
+    terms. Component class names are matched against `classes` the same
+    fuzzy way as sample folders (see normalize_class_key).
+
+    This is exact at every ontology level because hierarchical rollup is a
+    linear operator: rollup(A) + rollup(B) - rollup(C) == rollup(A + B - C)
+    for every region, so doing the +/- arithmetic directly on the already
+    hierarchically-rolled-up 'count' column is equivalent to doing it on the
+    raw (pre-rollup) cell sets.
+
+    Returns (combined_counts_df, combined_totals_df, resolved_info) where
+    resolved_info maps name -> a human-readable resolved formula string (for
+    documentation/traceability). These are returned as separate DataFrames
+    (not concatenated onto counts_df/totals_df) so callers can keep the raw
+    per-class analysis untouched and route combined categories elsewhere.
+    """
+    resolved_info = {}
+    empty_counts = counts_df.iloc[0:0]
+    empty_totals = totals_df.iloc[0:0]
+    if not category_formulas:
+        return empty_counts, empty_totals, resolved_info
+
+    combined_count_frames = []
+    combined_total_frames = []
+    for name, terms in category_formulas.items():
+        resolved_terms = []
+        for term in terms:
+            sign = 1 if str(term.get('sign', '+')).strip() == '+' else -1
+            c = term['class']
+            if c in classes:
+                resolved_terms.append((sign, c))
+                continue
+            key = normalize_class_key(c)
+            match = next((cl for cl in classes if normalize_class_key(cl) == key), None)
+            if match is None:
+                print(f"  [warn] combined category '{name}': component '{c}' not found among "
+                      f"classes {classes}, skipping it")
+                continue
+            resolved_terms.append((sign, match))
+
+        if not resolved_terms:
+            print(f"  [warn] combined category '{name}': no valid components found, skipping "
+                  f"this category entirely")
+            continue
+
+        weight_by_class = {}
+        for sign, cls in resolved_terms:
+            weight_by_class[cls] = weight_by_class.get(cls, 0) + sign
+
+        sub_counts = counts_df[counts_df['class_name'].isin(weight_by_class)].copy()
+        sub_counts['count'] = sub_counts['count'] * sub_counts['class_name'].map(weight_by_class)
+        summed = sub_counts.groupby(['group', 'sample', 'order'], as_index=False)['count'].sum()
+        summed['class_name'] = name
+        combined_count_frames.append(summed[['group', 'sample', 'class_name', 'order', 'count']])
+
+        sub_totals = totals_df[totals_df['class_name'].isin(weight_by_class)].copy()
+        sub_totals['total_valid'] = sub_totals['total_valid'] * sub_totals['class_name'].map(weight_by_class)
+        summed_totals = sub_totals.groupby(['group', 'sample'], as_index=False)['total_valid'].sum()
+        summed_totals['class_name'] = name
+        combined_total_frames.append(summed_totals[['group', 'sample', 'class_name', 'total_valid']])
+
+        parts = []
+        for i, (sign, cls) in enumerate(resolved_terms):
+            if i == 0:
+                parts.append(cls if sign > 0 else f"-{cls}")
+            else:
+                parts.append(f"+ {cls}" if sign > 0 else f"- {cls}")
+        resolved_info[name] = ' '.join(parts)
+
+    combined_counts_df = pd.concat(combined_count_frames, ignore_index=True) if combined_count_frames else empty_counts
+    combined_totals_df = pd.concat(combined_total_frames, ignore_index=True) if combined_total_frames else empty_totals
+    return combined_counts_df, combined_totals_df, resolved_info
+
+
 def build_region_metadata():
     """One row per 'order' index (0..n_structures-1) with id/name/level."""
     return pd.DataFrame({
@@ -189,6 +282,74 @@ def build_region_volumes(annotation_volume_path, voxel_size_um, cache_path=None,
     return df
 
 
+def build_per_sample_region_volumes(data_dir, samples, voxel_size_um, master_volumes,
+                                     cache_path=None, force=False):
+    """Per-(sample, order) region volume in mm^3, from each sample's own
+    transformix-warped atlas (<data_dir>/<sample>/volume/result.mhd) rather
+    than the static master atlas used by build_region_volumes() -- so
+    Density/Volume can reflect each sample's real anatomy (e.g. atrophy)
+    instead of a group-invariant constant. The warped volume is nearest-
+    neighbor interpolated (label-safe) and lives on that sample's own
+    known-voxel-size grid, so voxel-counting per label is a standard
+    atlas-based volumetry estimate (no Jacobian correction needed).
+
+    Falls back to master_volumes (the region-only, sample-independent
+    volumes) for any sample missing volume/result.mhd, with a warning, so
+    every (order, sample) pair is always present in the returned table."""
+    if cache_path and os.path.exists(cache_path) and not force:
+        print(f"Loaded per-sample region volumes from cache: {cache_path}")
+        return pd.read_csv(cache_path)
+
+    voxel_volume_mm3 = float(np.prod(voxel_size_um)) * 1e-9  # um^3 -> mm^3
+    # transformix's nearest-neighbor resampling of the master atlas into each
+    # sample's native grid can, at region-boundary voxels, pick up a handful of
+    # stray label values that aren't real ontology ids (interpolation artifact
+    # -- the un-warped master atlas doesn't have this issue). Treat those like
+    # background rather than crashing on an unknown id.
+    known_ids = set(int(i) for i in ano.get_list('id'))
+
+    frames = []
+    for sample in samples:
+        mhd_path = os.path.join(data_dir, sample, 'volume', 'result.mhd')
+        if not os.path.exists(mhd_path):
+            print(f"  [warn] missing {mhd_path}, falling back to master-atlas volumes for sample '{sample}'")
+            frames.append(pd.DataFrame({
+                'sample': sample,
+                'order': master_volumes['order'].values,
+                'voxel_count': master_volumes['voxel_count'].values,
+                'volume_mm3': master_volumes['volume_mm3'].values,
+            }))
+            continue
+
+        print(f"Computing per-sample region volumes for '{sample}' from {mhd_path} ...")
+        vol = clearmap_mhd.mhd_read(mhd_path)
+        ids_flat = np.asarray(vol).ravel().astype(int)
+        # id == 0 means background/outside-brain, same convention as build_region_volumes().
+        valid_ids = ids_flat[ids_flat > 0]
+        known_mask = np.isin(valid_ids, list(known_ids))
+        n_unknown = (~known_mask).sum()
+        if n_unknown:
+            print(f"  [warn] sample '{sample}': dropping {n_unknown} voxels "
+                  f"({100 * n_unknown / len(valid_ids):.3f}%) with warp-interpolation-artifact ids "
+                  f"not in the ontology: {sorted(set(valid_ids[~known_mask].tolist()))}")
+        valid_ids = valid_ids[known_mask]
+        order_flat = ano.convert_label(valid_ids, key='id', value='order')
+        voxel_bins = ano.count_label(order_flat, key='order', hierarchical=True).astype(float)
+
+        frames.append(pd.DataFrame({
+            'sample': sample,
+            'order': np.arange(ano.n_structures),
+            'voxel_count': voxel_bins,
+            'volume_mm3': voxel_bins * voxel_volume_mm3,
+        }))
+
+    df = pd.concat(frames, ignore_index=True)
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
+        df.to_csv(cache_path, index=False)
+    return df
+
+
 # ================= Count collection =================
 
 def collect_counts(data_dir, classes, group_samples):
@@ -218,7 +379,7 @@ def collect_counts(data_dir, classes, group_samples):
     return counts_df, totals_df
 
 
-def metric_matrix(counts_df, totals_df, volumes_df, class_name, metric, group_key, samples):
+def metric_matrix(counts_df, totals_df, per_sample_volumes, class_name, metric, group_key, samples):
     """Returns a (n_structures, n_samples) matrix, row-ordered by 'order',
     column-ordered by `samples`."""
     sub = counts_df[(counts_df['class_name'] == class_name) & (counts_df['group'] == group_key)]
@@ -236,11 +397,18 @@ def metric_matrix(counts_df, totals_df, volumes_df, class_name, metric, group_ke
         pct[:, nonzero] = mat[:, nonzero] / tot[nonzero] * 100.0
         return pct
 
-    if metric == 'Density':
-        vol = volumes_df.set_index('order')['volume_mm3'].reindex(pivot.index).values.astype(float)
+    if metric in ('Density', 'Volume'):
+        # Per-(order, sample) volume from each sample's own warped atlas, NOT a
+        # region-only constant -- this is what lets Density reflect real
+        # per-sample anatomy (e.g. atrophy) instead of being a fixed rescaling
+        # of Count.
+        vol_mat = (per_sample_volumes.pivot(index='order', columns='sample', values='volume_mm3')
+                   .reindex(index=pivot.index, columns=samples).values.astype(float))
+        if metric == 'Volume':
+            return vol_mat
         density = np.full_like(mat, np.nan)
-        nonzero = vol > 0
-        density[nonzero, :] = mat[nonzero, :] / vol[nonzero, None]
+        nonzero = vol_mat > 0
+        density[nonzero] = mat[nonzero] / vol_mat[nonzero]
         return density
 
     raise ValueError(f"Unknown metric: {metric}")
@@ -258,7 +426,7 @@ def welch_ttest(mat_a, mat_b):
     return p
 
 
-def run_level_tests(mat_a, mat_b, metadata, level, class_name, metric):
+def run_level_tests(mat_a, mat_b, metadata, level, class_name, metric, samples_a, samples_b):
     """Restrict to regions at this ontology level, drop regions with zero
     total signal in both groups, run Welch's t-test, then FDR-correct
     (BH) within this level's surviving p-values only (each level is its own
@@ -301,10 +469,45 @@ def run_level_tests(mat_a, mat_b, metadata, level, class_name, metric):
     out['mean_a_is_zero'] = mean_a_is_zero
     out['p_value'] = p
     out['p_fdr'] = p_fdr
+    # Raw per-sample values behind mean_a/mean_b, one column per sample
+    # (named after the sample itself), group A then group B.
+    for i, s in enumerate(samples_a):
+        out[s] = a[:, i]
+    for j, s in enumerate(samples_b):
+        out[s] = b[:, j]
     return out
 
 
 # ================= Orchestration =================
+
+def run_group_comparison(counts_df, totals_df, per_sample_volumes, volumes, metadata, class_names,
+                          samples_a, samples_b):
+    """Runs metric_matrix + run_level_tests across all levels/metrics for the
+    given class_names, returning one concatenated, volume-annotated
+    DataFrame (empty if class_names is empty or nothing survives the
+    per-level zero-total filter in run_level_tests)."""
+    max_level = int(metadata['level'].max())
+    rows = []
+    for cls in class_names:
+        for metric in METRICS:
+            mat_a = metric_matrix(counts_df, totals_df, per_sample_volumes, cls, metric, 'a', samples_a)
+            mat_b = metric_matrix(counts_df, totals_df, per_sample_volumes, cls, metric, 'b', samples_b)
+            for level in range(max_level + 1):
+                res = run_level_tests(mat_a, mat_b, metadata, level, cls, metric, samples_a, samples_b)
+                if not res.empty:
+                    rows.append(res)
+
+    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not result.empty:
+        result[['fold_change', 'log2fc']] = result[['fold_change', 'log2fc']].replace([np.inf, -np.inf], np.nan)
+        # Static master-atlas reference volume only -- NOT what Density/Volume
+        # metric rows' mean_a/mean_b are computed from (those use each sample's
+        # own warped-atlas volume; see per_sample_volumes).
+        result = result.merge(
+            volumes[['order', 'volume_mm3']].rename(columns={'volume_mm3': 'volume_mm3_atlas_ref'}),
+            on='order', how='left')
+    return result
+
 
 def run_all_stats(cfg):
     ano.initialize(label_file=cfg.get('label_file'))
@@ -321,6 +524,10 @@ def run_all_stats(cfg):
     samples_a = groups_cfg['a']['samples']
     samples_b = groups_cfg['b']['samples']
 
+    all_samples = sorted(set(samples_a) | set(samples_b))
+    per_sample_volumes = build_per_sample_region_volumes(
+        cfg['data_dir'], all_samples, voxel_size_um, volumes, cfg.get('per_sample_volume_cache'))
+
     classes = cfg.get('classes') or discover_classes(cfg['data_dir'], samples_a + samples_b)
     print(f"Classes: {classes}")
     print(f"Group A ({group_a_name}): {samples_a}")
@@ -328,24 +535,27 @@ def run_all_stats(cfg):
 
     counts_df, totals_df = collect_counts(cfg['data_dir'], classes, {'a': samples_a, 'b': samples_b})
 
-    max_level = int(metadata['level'].max())
-    all_rows = []
-    for cls in classes:
-        for metric in METRICS:
-            mat_a = metric_matrix(counts_df, totals_df, volumes, cls, metric, 'a', samples_a)
-            mat_b = metric_matrix(counts_df, totals_df, volumes, cls, metric, 'b', samples_b)
-            for level in range(max_level + 1):
-                res = run_level_tests(mat_a, mat_b, metadata, level, cls, metric)
-                if not res.empty:
-                    all_rows.append(res)
-
-    result = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+    result = run_group_comparison(counts_df, totals_df, per_sample_volumes, volumes, metadata,
+                                   classes, samples_a, samples_b)
     if not result.empty:
-        result[['fold_change', 'log2fc']] = result[['fold_change', 'log2fc']].replace([np.inf, -np.inf], np.nan)
+        result['formula'] = ''
 
-    # attach region volumes for reference (joined by order, independent of class/metric loop above)
-    result = result.merge(volumes[['order', 'volume_mm3']], on='order', how='left', suffixes=('', '_ref'))
-    return result, group_a_name, group_b_name
+    combined_counts_df, combined_totals_df, formula_info = compute_combined_categories(
+        counts_df, totals_df, cfg.get('combined_categories'), classes)
+    if formula_info:
+        print(f"Combined categories: {formula_info}")
+        combined_result = run_group_comparison(
+            combined_counts_df, combined_totals_df, per_sample_volumes, volumes, metadata,
+            list(formula_info.keys()), samples_a, samples_b)
+        if not combined_result.empty:
+            combined_result['formula'] = combined_result['class_name'].map(formula_info)
+            # Combined categories are folded straight into the same rows/sheets
+            # as the raw classes (distinguished only by the 'formula' column),
+            # not routed to a separate sheet.
+            result = pd.concat([result, combined_result], ignore_index=True) if not result.empty else combined_result
+
+    return (result, group_a_name, group_b_name, counts_df, totals_df, volumes, per_sample_volumes, metadata,
+            combined_counts_df, combined_totals_df, formula_info)
 
 
 def write_outputs(df, cfg, group_a_name, group_b_name):
@@ -360,32 +570,42 @@ def write_outputs(df, cfg, group_a_name, group_b_name):
     excel_path = os.path.join(out_dir, out_cfg.get('excel', 'region_stats_by_level.xlsx'))
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         readme = pd.DataFrame({
-            'column': ['level', 'order', 'id', 'graph_order', 'name', 'class_name', 'metric',
+            'column': ['level', 'order', 'id', 'graph_order', 'name', 'class_name', 'formula', 'metric',
                        'n_a', 'n_b', 'mean_a', 'mean_b', 'fold_change', 'log2fc',
-                       'mean_a_is_zero', 'p_value', 'p_fdr', 'volume_mm3'],
+                       'mean_a_is_zero', 'p_value', 'p_fdr', 'volume_mm3_atlas_ref', '<sample name>'],
             'description': [
                 'Ontology tree depth from root (0=whole brain, higher=finer subregions)',
                 "ClearMap's internal dense region index (stable within one ontology file)",
                 'Allen CCF structure id',
                 "Allen ontology 'graph_order' value",
                 'Region name',
-                'Cell class / marker-combination name (from cell_registration/<class_name>/ folder)',
-                'Count / Percentage / Density',
+                'Cell class / marker-combination name (from cell_registration/<class_name>/ folder), '
+                'or an aggregate category name defined in config combined_categories (e.g. glia_total)',
+                "Resolved +/- formula over raw classes, for aggregate categories only "
+                '(empty for ordinary, non-aggregate classes)',
+                'Count / Percentage / Density / Volume',
                 f'Number of samples in group A ({group_a_name})',
                 f'Number of samples in group B ({group_b_name})',
-                f'Mean metric value, group A ({group_a_name})',
-                f'Mean metric value, group B ({group_b_name})',
+                f'Mean metric value, group A ({group_a_name}) -- for Volume, mean region volume in mm^3 '
+                "from each sample's own transformix-warped atlas (see per-sample volumes, not "
+                'volume_mm3_atlas_ref)',
+                f'Mean metric value, group B ({group_b_name}); see mean_a note',
                 'mean_b / mean_a (NaN if mean_a == 0 -- fold change undefined)',
                 'log2(fold_change); NaN if undefined or infinite (complete presence/absence)',
                 'True if mean_a == 0 (fold_change/log2fc undefined for this region)',
                 "Welch's t-test p-value (unequal variance), raw/uncorrected",
                 'Benjamini-Hochberg FDR-corrected p-value, computed separately within each level',
-                'Region volume in mm^3 (from master atlas volume; used for Density metric)',
+                'Static reference only: region volume in mm^3 from the master atlas, same for every '
+                'sample/group. NOT what Density or Volume metric rows are computed from -- those use '
+                "each sample's own warped-atlas volume, which varies per sample (e.g. with atrophy).",
+                'One column per sample (named after the sample folder), group A samples first then '
+                "group B, matching the n_a/n_b order. Holds that sample's own raw value for this "
+                "row's metric (same unit as mean_a/mean_b) -- the individual values behind each mean.",
             ],
         })
         readme.to_excel(writer, sheet_name='ReadMe', index=False)
 
-        volumes_out = df[['order', 'id', 'name', 'level', 'volume_mm3']].drop_duplicates().sort_values('order')
+        volumes_out = df[['order', 'id', 'name', 'level', 'volume_mm3_atlas_ref']].drop_duplicates().sort_values('order')
         volumes_out.to_excel(writer, sheet_name='Region_Volumes', index=False)
 
         max_level = int(df['level'].max()) if not df.empty else -1
@@ -397,14 +617,80 @@ def write_outputs(df, cfg, group_a_name, group_b_name):
     print(f"Wrote Excel workbook: {excel_path}")
 
 
+def write_per_sample_tables(counts_df, totals_df, volumes, per_sample_volumes, metadata, combined_counts_df,
+                             combined_totals_df, formula_info, out_dir):
+    """One workbook per sample, one sheet per ontology level (L00, L01, ...):
+    every class (incl. combined categories) x every ontology region, with
+    Count/Percentage/Density -- a full per-sample registration inventory,
+    independent of any group comparison. Unlike the group-comparison output,
+    zero-count regions are kept so the file can double as a QC view of one
+    sample's whole registration."""
+    sample_dir = os.path.join(out_dir, 'per_sample')
+    os.makedirs(sample_dir, exist_ok=True)
+
+    all_counts = pd.concat([counts_df, combined_counts_df], ignore_index=True)
+    all_totals = pd.concat([totals_df, combined_totals_df], ignore_index=True)
+
+    master_vol_lookup = volumes.set_index('order')['volume_mm3']
+    meta_indexed = metadata.set_index('order')
+    order_index = metadata['order'].values
+
+    sample_keys = all_counts[['group', 'sample']].drop_duplicates().itertuples(index=False)
+    for group, sample in sample_keys:
+        sub = all_counts[(all_counts['group'] == group) & (all_counts['sample'] == sample)]
+        totals = (all_totals[(all_totals['group'] == group) & (all_totals['sample'] == sample)]
+                  .set_index('class_name')['total_valid'])
+
+        # This sample's own warped-atlas volumes (falls back to the master-atlas
+        # lookup if per_sample_volumes has no rows for this sample, e.g. an
+        # unrecognized sample name).
+        sample_vols = per_sample_volumes[per_sample_volumes['sample'] == sample]
+        vol_lookup = sample_vols.set_index('order')['volume_mm3'] if not sample_vols.empty else master_vol_lookup
+
+        pieces = []
+        for cls, g in sub.groupby('class_name'):
+            count = g.set_index('order')['count'].reindex(order_index).fillna(0.0)
+            total_valid = totals.get(cls, 0)
+            pct = (count / total_valid * 100.0) if total_valid > 0 else pd.Series(np.nan, index=count.index)
+            vol = vol_lookup.reindex(count.index)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                density = np.where(vol.values > 0, count.values / vol.values, np.nan)
+
+            piece = meta_indexed.loc[count.index, ['id', 'graph_order', 'name', 'level']].copy()
+            piece['order'] = piece.index
+            piece['class_name'] = cls
+            piece['formula'] = formula_info.get(cls, '')
+            piece['count'] = count.values
+            piece['percentage'] = pct.values
+            piece['density'] = density
+            piece['volume_mm3'] = vol.values
+            pieces.append(piece.reset_index(drop=True))
+
+        sample_table = pd.concat(pieces, ignore_index=True).sort_values(['level', 'class_name', 'order'])
+        out_path = os.path.join(sample_dir, f'{sample}_region_registration_summary.xlsx')
+        max_level = int(sample_table['level'].max()) if not sample_table.empty else -1
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            for level in range(max_level + 1):
+                sheet = sample_table[sample_table['level'] == level].sort_values(['class_name', 'order'])
+                if sheet.empty:
+                    continue
+                sheet.to_excel(writer, sheet_name=f'L{level:02d}', index=False)
+        print(f"Wrote per-sample region summary: {out_path} ({len(sample_table)} rows)")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True, help='Path to YAML config file')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    df, group_a_name, group_b_name = run_all_stats(cfg)
+    (df, group_a_name, group_b_name, counts_df, totals_df, volumes, per_sample_volumes, metadata,
+     combined_counts_df, combined_totals_df, formula_info) = run_all_stats(cfg)
     write_outputs(df, cfg, group_a_name, group_b_name)
+
+    out_dir = cfg.get('output', {}).get('dir', './stats_output')
+    write_per_sample_tables(counts_df, totals_df, volumes, per_sample_volumes, metadata,
+                             combined_counts_df, combined_totals_df, formula_info, out_dir)
 
 
 if __name__ == '__main__':

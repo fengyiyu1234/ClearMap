@@ -19,12 +19,91 @@ groups:
 # and "glia_GFP" are treated as the same class.
 classes: null
 
+# Optional aggregate-category comparisons: each entry defines a named
+# pseudo-class as a combination of existing classes, and gets its own
+# group-comparison stats (Count/Percentage/Density, all ontology levels).
+# Rows for these aggregate categories are folded into the SAME region_stats.csv
+# / L00..Lxx sheets as the raw classes (distinguished by the 'formula' column,
+# which is empty for ordinary classes) -- there's no separate sheet for them.
+#
+# WHY PLAIN SUMS: the upstream cell-classification pipeline (brain_detector's
+# run_inference.py -> stitcher.py: match_soma_3d_iou + _merge_class,
+# annotate_soma_with_tf_containment) matches candidate cells across marker
+# channels via greedy 3D IoU / containment, and merges each matched group
+# into ONE row with ONE composite class label (e.g. "glia_GFP_RFP") before
+# writing per-class CSVs. So every physical cell is written to EXACTLY ONE
+# class file -- these classes are mutually-exclusive partitions, not nested
+# subsets -- and combined categories are just plain sums with no overlap to
+# correct for. (Confirmed both by reading that merge/grouping code and
+# empirically: ob_glia_GFP_RFP.csv centroids don't spatially match
+# ob_glia_GFP.csv centroids at all -- they're disjoint cell sets.)
+# Component class names are matched fuzzily against `classes` the same way
+# as sample folders. The engine (compute_combined_categories) still accepts
+# a signed +/- term list for other datasets where classes genuinely nest,
+# it's just that every term below is "+" for this one.
+#
+# The 7 entries below assume the actual cell_registration/ layout (per cell
+# type: _GFP, _RFP, _GFP_RFP, _GFP_Sox9, _RFP_Sox9, _GFP_RFP_Sox9) and that
+# glia/neuron are mutually-exclusive cell populations (suppress_cross_class_
+# overlap in the upstream pipeline already drops overlapping neuron detections
+# in favor of glia, so there's no cross-type overlap to worry about either).
+combined_categories:
+  glia_total:
+    - {sign: "+", class: glia_GFP}
+    - {sign: "+", class: glia_RFP}
+    - {sign: "+", class: glia_GFP_RFP}
+    - {sign: "+", class: glia_GFP_Sox9}
+    - {sign: "+", class: glia_RFP_Sox9}
+    - {sign: "+", class: glia_GFP_RFP_Sox9}
+  neuron_total:
+    - {sign: "+", class: neuron_GFP}
+    - {sign: "+", class: neuron_RFP}
+    - {sign: "+", class: neuron_GFP_RFP}
+    - {sign: "+", class: neuron_GFP_Sox9}
+    - {sign: "+", class: neuron_RFP_Sox9}
+    - {sign: "+", class: neuron_GFP_RFP_Sox9}
+  gfp_total:  # every class containing GFP, either cell type, incl. double/triple positives
+    - {sign: "+", class: glia_GFP}
+    - {sign: "+", class: glia_GFP_RFP}
+    - {sign: "+", class: glia_GFP_Sox9}
+    - {sign: "+", class: glia_GFP_RFP_Sox9}
+    - {sign: "+", class: neuron_GFP}
+    - {sign: "+", class: neuron_GFP_RFP}
+    - {sign: "+", class: neuron_GFP_Sox9}
+    - {sign: "+", class: neuron_GFP_RFP_Sox9}
+  rfp_total:  # every class containing RFP, either cell type, incl. double/triple positives
+    - {sign: "+", class: glia_RFP}
+    - {sign: "+", class: glia_GFP_RFP}
+    - {sign: "+", class: glia_RFP_Sox9}
+    - {sign: "+", class: glia_GFP_RFP_Sox9}
+    - {sign: "+", class: neuron_RFP}
+    - {sign: "+", class: neuron_GFP_RFP}
+    - {sign: "+", class: neuron_RFP_Sox9}
+    - {sign: "+", class: neuron_GFP_RFP_Sox9}
+  glia_sox9_total:
+    - {sign: "+", class: glia_GFP_Sox9}
+    - {sign: "+", class: glia_RFP_Sox9}
+    - {sign: "+", class: glia_GFP_RFP_Sox9}
+  neuron_sox9_total:
+    - {sign: "+", class: neuron_GFP_Sox9}
+    - {sign: "+", class: neuron_RFP_Sox9}
+    - {sign: "+", class: neuron_GFP_RFP_Sox9}
+  sox9_total:  # all Sox9+ cells brain-wide, any cell type/reporter = glia_sox9_total + neuron_sox9_total
+    - {sign: "+", class: glia_GFP_Sox9}
+    - {sign: "+", class: glia_RFP_Sox9}
+    - {sign: "+", class: glia_GFP_RFP_Sox9}
+    - {sign: "+", class: neuron_GFP_Sox9}
+    - {sign: "+", class: neuron_RFP_Sox9}
+    - {sign: "+", class: neuron_GFP_RFP_Sox9}
+
 # Ontology JSON to use. Leave null to use ClearMap's bundled default
 # (ClearMap/Resources/Atlas/p5_trimmed/CCF_v3_ontology.json).
 label_file: null
 
-# Atlas volume used to compute region volumes for the Density metric (one
-# static lookup, independent of any single sample's registration crop).
+# Atlas volume used to compute the static, sample-independent reference
+# region volumes (volume_mm3_atlas_ref column) -- NOT what Density/Volume
+# metrics are computed from; those use each sample's own per_sample_volume_cache
+# below (one static lookup, independent of any single sample's registration crop).
 # Leave null to use ClearMap's bundled default p5 volume file.
 annotation_volume: ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_annotation_trimmed_1_3_2__285-510_full_full.tif
 
@@ -35,6 +114,19 @@ output:
   dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/stats
   long_table: region_stats.csv        # canonical tidy output, read by stats_img_vis_ui.py
   excel: region_stats_by_level.xlsx   # human-browsable workbook, one sheet per ontology level
+  # In addition to the above group-comparison outputs, one per-sample workbook
+  # is always written to <dir>/per_sample/<sample>_region_registration_summary.xlsx,
+  # one sheet per ontology level (L00, L01, ...): every class (incl.
+  # combined_categories) x every region, with Count/Percentage/Density for
+  # that single sample -- no group comparison, zero-count regions kept,
+  # useful as a per-sample registration QC view.
 
 # Cache for the (expensive, one-time) per-region volume computation.
 volume_cache: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/stats/atlas_region_volumes.csv
+
+# Cache for per-sample region volumes, computed from each sample's own
+# <data_dir>/<sample>/volume/result.mhd (transformix-warped atlas produced by
+# cellMap.py's transform_annotation_volume()). Used by the Density metric
+# (denominator) and the Volume metric, so both reflect real per-sample
+# anatomy (e.g. atrophy) instead of the fixed master-atlas volume above.
+per_sample_volume_cache: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/stats/per_sample_region_volumes.csv
