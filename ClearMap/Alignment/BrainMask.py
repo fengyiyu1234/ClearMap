@@ -16,14 +16,23 @@ import argparse
 import numpy as np
 from scipy import ndimage
 from skimage.filters import threshold_otsu
-from skimage.morphology import ball
+from skimage.morphology import ball, convex_hull_image
 
 import ClearMap.IO.IO as io
 
 
 def generate_brain_mask(image, sink_path=None, sigma=1.0, closing_radius=3,
-                         dilate_radius=2):
+                         dilate_radius=2, slice_axis=2):
     """Generate a binary tissue mask from a resampled brain image.
+
+    Signal is often concentrated in cortex, so a plain Otsu threshold marks
+    weakly-labeled interior structures as background, leaving a hollow
+    cortical "shell" instead of a solid brain mask. To fix that, each 2D
+    slice along `slice_axis` (default: Z, the coronal-section stacking axis
+    in this pipeline) is solidified with its convex hull — i.e. the
+    outermost outline of that section is connected and everything inside it
+    is filled — rather than relying on 3D hole-filling, which requires the
+    shell to be fully closed in 3D and fails wherever it isn't.
 
     Arguments
     ---------
@@ -35,11 +44,15 @@ def generate_brain_mask(image, sink_path=None, sigma=1.0, closing_radius=3,
         Gaussian pre-smoothing sigma (voxels) applied before Otsu
         thresholding, to reduce noise-driven false positives.
     closing_radius : int
-        Radius (voxels) of the structuring element used for binary closing
-        (bridges small gaps in the thresholded tissue).
+        Radius (voxels) of the structuring element used for binary closing,
+        applied before the per-slice convex hull (cleans up small noise/gaps
+        so they don't distort a slice's hull).
     dilate_radius : int
         Radius (voxels) of a final binary dilation, giving the mask a small
         safety margin so it doesn't clip real tissue near the boundary.
+    slice_axis : int
+        Axis to take 2D slices along for the convex-hull fill (0=X, 1=Y,
+        2=Z). Should match the axis along which sections were acquired.
 
     Returns
     -------
@@ -57,8 +70,15 @@ def generate_brain_mask(image, sink_path=None, sigma=1.0, closing_radius=3,
 
     if closing_radius > 0:
         mask = ndimage.binary_closing(mask, structure=ball(closing_radius))
-    mask = ndimage.binary_fill_holes(mask)
 
+    mask = np.moveaxis(mask, slice_axis, 0)
+    for i, section in enumerate(mask):
+        if section.any():
+            mask[i] = convex_hull_image(section)
+    mask = np.moveaxis(mask, 0, slice_axis)
+
+    # Clean up any noise blobs the per-slice hull turned solid but that are
+    # still disconnected from the main (largest) brain volume in 3D.
     labeled, n_components = ndimage.label(mask)
     if n_components > 1:
         sizes = ndimage.sum(mask, labeled, index=range(1, n_components + 1))

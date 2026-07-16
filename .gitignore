@@ -8,6 +8,9 @@ ClearMap*Real.yml
 .idea
 *pyproject.user*
 
+# Local Claude Code instructions (not tracked)
+CLAUDE.md
+
 # OS generated files
 .DS_Store
 .DS_Store?
