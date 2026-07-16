@@ -69,27 +69,37 @@ def filter_valid(graph_order, names):
 
 
 def class_counts_for_sample(csv_path):
-    """Returns (bins, total_valid). bins is a hierarchical rollup: bins[order]
-    = count directly in that region + all its descendants."""
+    """Returns (bins, direct_bins, total_valid). bins is a hierarchical
+    rollup: bins[order] = count directly in that region + all its
+    descendants. direct_bins[order] = count assigned exactly to that region
+    with no rollup -- i.e. cells whose registration stopped there and never
+    resolved to any finer subregion. Since hierarchical rollup is defined as
+    rollup(node) = direct(node) + sum(rollup(child) for child in children),
+    direct_bins is exactly the per-region "lost" count used by the per-sample
+    tree report to flag incomplete registration depth."""
     if not os.path.exists(csv_path):
         print(f"  [warn] missing {csv_path}, treating as zero cells")
-        return np.zeros(ano.n_structures, dtype=float), 0
+        z = np.zeros(ano.n_structures, dtype=float)
+        return z, z.copy(), 0
     try:
         graph_order, names = read_cell_registration(csv_path)
     except pd.errors.EmptyDataError:
-        return np.zeros(ano.n_structures, dtype=float), 0
+        z = np.zeros(ano.n_structures, dtype=float)
+        return z, z.copy(), 0
 
     valid = filter_valid(graph_order, names)
     if len(valid) == 0:
-        return np.zeros(ano.n_structures, dtype=float), 0
+        z = np.zeros(ano.n_structures, dtype=float)
+        return z, z.copy(), 0
 
     # Convert to ClearMap's dense 'order' index first, then roll up hierarchically.
     # NOTE: ano.count_label() has a bug if called with any key other than 'order'
     # (it passes an unsupported `invalid=` kwarg to convert_label internally), so
     # always pre-convert to 'order' ourselves and call count_label(key='order').
     order_arr = ano.convert_label(valid, key='graph_order', value='order')
+    direct_bins = np.bincount(order_arr, minlength=ano.n_structures).astype(float)
     bins = ano.count_label(order_arr, key='order', hierarchical=True).astype(float)
-    return bins, len(valid)
+    return bins, direct_bins, len(valid)
 
 
 # ================= Ontology metadata & region volumes =================
@@ -240,6 +250,43 @@ def compute_combined_categories(counts_df, totals_df, category_formulas, classes
     return combined_counts_df, combined_totals_df, resolved_info
 
 
+def compute_combined_direct_counts(direct_counts_df, category_formulas, classes):
+    """Direct-count (non-hierarchical) analogue of the count combination in
+    compute_combined_categories -- same +/- formula arithmetic over the same
+    weight_by_class resolution, since a plain bincount is just as linear over
+    mutually-exclusive class partitions as the hierarchical rollup is (see
+    compute_combined_categories docstring). Needed so combined categories
+    (e.g. glia_total) get correct 'Lost cells' rows in the per-sample tree
+    report, not just correct rollup counts."""
+    empty = direct_counts_df.iloc[0:0]
+    if not category_formulas:
+        return empty
+
+    frames = []
+    for name, terms in category_formulas.items():
+        weight_by_class = {}
+        for term in terms:
+            sign = 1 if str(term.get('sign', '+')).strip() == '+' else -1
+            c = term['class']
+            if c not in classes:
+                key = normalize_class_key(c)
+                match = next((cl for cl in classes if normalize_class_key(cl) == key), None)
+                if match is None:
+                    continue
+                c = match
+            weight_by_class[c] = weight_by_class.get(c, 0) + sign
+        if not weight_by_class:
+            continue
+
+        sub = direct_counts_df[direct_counts_df['class_name'].isin(weight_by_class)].copy()
+        sub['direct_count'] = sub['direct_count'] * sub['class_name'].map(weight_by_class)
+        summed = sub.groupby(['group', 'sample', 'order'], as_index=False)['direct_count'].sum()
+        summed['class_name'] = name
+        frames.append(summed[['group', 'sample', 'class_name', 'order', 'direct_count']])
+
+    return pd.concat(frames, ignore_index=True) if frames else empty
+
+
 def build_region_metadata():
     """One row per 'order' index (0..n_structures-1) with id/name/level."""
     return pd.DataFrame({
@@ -354,10 +401,11 @@ def build_per_sample_region_volumes(data_dir, samples, voxel_size_um, master_vol
 
 def collect_counts(data_dir, classes, group_samples):
     """group_samples: dict[group_key] -> list[sample names].
-    Returns (counts_df, totals_df) long-format DataFrames."""
+    Returns (counts_df, direct_counts_df, totals_df) long-format DataFrames."""
     n = ano.n_structures
     orders = np.arange(n)
     count_frames = []
+    direct_frames = []
     total_rows = []
     for group_key, samples in group_samples.items():
         for sample in samples:
@@ -365,18 +413,23 @@ def collect_counts(data_dir, classes, group_samples):
                 actual_dir = resolve_sample_class_dir(data_dir, sample, cls)
                 if actual_dir is None:
                     print(f"  [warn] no folder matching class '{cls}' for sample {sample}, treating as zero cells")
-                    bins, total = np.zeros(n, dtype=float), 0
+                    bins, direct_bins, total = np.zeros(n, dtype=float), np.zeros(n, dtype=float), 0
                 else:
                     csv_path = os.path.join(data_dir, sample, 'cell_registration', actual_dir, 'cell_registration.csv')
-                    bins, total = class_counts_for_sample(csv_path)
+                    bins, direct_bins, total = class_counts_for_sample(csv_path)
                 count_frames.append(pd.DataFrame({
                     'group': group_key, 'sample': sample, 'class_name': cls,
                     'order': orders, 'count': bins,
                 }))
+                direct_frames.append(pd.DataFrame({
+                    'group': group_key, 'sample': sample, 'class_name': cls,
+                    'order': orders, 'direct_count': direct_bins,
+                }))
                 total_rows.append({'group': group_key, 'sample': sample, 'class_name': cls, 'total_valid': total})
     counts_df = pd.concat(count_frames, ignore_index=True)
+    direct_counts_df = pd.concat(direct_frames, ignore_index=True)
     totals_df = pd.DataFrame(total_rows)
-    return counts_df, totals_df
+    return counts_df, direct_counts_df, totals_df
 
 
 def metric_matrix(counts_df, totals_df, per_sample_volumes, class_name, metric, group_key, samples):
@@ -533,7 +586,7 @@ def run_all_stats(cfg):
     print(f"Group A ({group_a_name}): {samples_a}")
     print(f"Group B ({group_b_name}): {samples_b}")
 
-    counts_df, totals_df = collect_counts(cfg['data_dir'], classes, {'a': samples_a, 'b': samples_b})
+    counts_df, direct_counts_df, totals_df = collect_counts(cfg['data_dir'], classes, {'a': samples_a, 'b': samples_b})
 
     result = run_group_comparison(counts_df, totals_df, per_sample_volumes, volumes, metadata,
                                    classes, samples_a, samples_b)
@@ -542,6 +595,8 @@ def run_all_stats(cfg):
 
     combined_counts_df, combined_totals_df, formula_info = compute_combined_categories(
         counts_df, totals_df, cfg.get('combined_categories'), classes)
+    combined_direct_counts_df = compute_combined_direct_counts(
+        direct_counts_df, cfg.get('combined_categories'), classes)
     if formula_info:
         print(f"Combined categories: {formula_info}")
         combined_result = run_group_comparison(
@@ -554,8 +609,8 @@ def run_all_stats(cfg):
             # not routed to a separate sheet.
             result = pd.concat([result, combined_result], ignore_index=True) if not result.empty else combined_result
 
-    return (result, group_a_name, group_b_name, counts_df, totals_df, volumes, per_sample_volumes, metadata,
-            combined_counts_df, combined_totals_df, formula_info)
+    return (result, group_a_name, group_b_name, counts_df, direct_counts_df, totals_df, volumes, per_sample_volumes,
+            metadata, combined_counts_df, combined_direct_counts_df, combined_totals_df, formula_info)
 
 
 def write_outputs(df, cfg, group_a_name, group_b_name):
@@ -678,19 +733,194 @@ def write_per_sample_tables(counts_df, totals_df, volumes, per_sample_volumes, m
         print(f"Wrote per-sample region summary: {out_path} ({len(sample_table)} rows)")
 
 
+# ================= Per-sample tree report =================
+
+LOST_LABEL = 'Lost cells'
+
+
+def build_children_map(metadata):
+    """order -> list of child orders, from the static ontology tree structure
+    itself (independent of any sample's data). A node's tree-traversal index
+    already equals its 'order' value (both come from the same DFS -- see
+    Annotation.add_data('order', range(n_structures)) in Annotation.py, which
+    walks the tree the same way build_region_metadata()'s np.arange(order)
+    assumes), so bucketing ano's Label tree by n.parent['order'] gives an
+    order-indexed children list directly."""
+    nodes = ano.get_list(None)
+    children = [[] for _ in range(len(nodes))]
+    for n in nodes:
+        if n.parent is not None:
+            children[n.parent['order']].append(n['order'])
+    return children
+
+
+def build_tree_rows(rollup, direct, children_map, names, levels, root_order):
+    """DFS over the ontology, keeping only nodes with nonzero rollup count for
+    this one (sample, class). Emits one row per terminal point of actual
+    data: either a true ontology leaf, or an internal node where some cells
+    registered to it but never resolved to any of its finer subregions. That
+    gap is exactly direct[node] (hierarchical rollup is defined as
+    rollup(node) = direct(node) + sum(rollup(child) for child in children)),
+    so it's emitted as a synthetic 'Lost cells' child one level deeper --
+    meaning at every level, sibling counts (real children + Lost cells)
+    always sum exactly to their parent's count. Rows are returned in DFS
+    (root-to-leaf, sibling) order, ready to become sheet rows top to bottom."""
+    rows = []
+
+    def walk(order, path):
+        count = rollup[order]
+        if count <= 0:
+            return
+        path = path + [(levels[order], names[order], count)]
+        kids = children_map[order]
+        if not kids:
+            rows.append(path)
+            return
+        for c in kids:
+            walk(c, path)
+        lost = direct[order]
+        if lost > 1e-6:
+            rows.append(path + [(levels[order] + 1, LOST_LABEL, lost)])
+
+    walk(root_order, [])
+    return rows
+
+
+def tree_rows_to_frame(rows):
+    """rows -> one row per DFS path, columns as (LevelX_Name, LevelX_Count)
+    pairs from level 0 to the deepest level any row reaches; a row shorter
+    than that depth just leaves the remaining pairs blank (its path ended
+    there, at a true leaf or a 'Lost cells' entry)."""
+    if not rows:
+        return pd.DataFrame()
+    max_level = max(lvl for row in rows for lvl, _, _ in row)
+    records = []
+    for row in rows:
+        rec = {}
+        for lvl, name, count in row:
+            rec[f'L{lvl:02d}_Name'] = name
+            rec[f'L{lvl:02d}_Count'] = count
+        records.append(rec)
+    cols = [c for lvl in range(max_level + 1) for c in (f'L{lvl:02d}_Name', f'L{lvl:02d}_Count')]
+    return pd.DataFrame.from_records(records, columns=cols)
+
+
+def _safe_sheet_name(name):
+    """Excel sheet names: max 31 chars, and disallow []:*?/\\."""
+    safe = re.sub(r'[\[\]:*?/\\]', '_', str(name))
+    return safe[:31] if safe else 'Sheet'
+
+
+def write_per_sample_tree_workbooks(counts_df, direct_counts_df, combined_counts_df, combined_direct_counts_df,
+                                     totals_df, combined_totals_df, metadata, out_dir):
+    """One workbook per sample, one sheet per class (incl. combined
+    categories), tree-shaped: columns come in (LevelX_Name, LevelX_Count)
+    pairs from level 0 down to however deep that class's data goes for this
+    sample. Every count is the hierarchical rollup (region + all its
+    descendants, same convention as region_stats_by_level.xlsx), so sibling
+    counts at any level always sum to their parent's count -- including a
+    synthetic 'Lost cells' row wherever some cells registered to a region but
+    were never resolved to any of its finer subregions.
+
+    That gap is exactly why a class's cell count can look complete at a
+    coarse level (0-4) but be missing cells at finer levels (5-8): those
+    'lost' cells never appear in any finer-level bin at all. The Summary
+    sheet gives a per-class, per-level running total of how many cells are
+    lost this way, independent of the tree layout."""
+    children_map = build_children_map(metadata)
+    has_children = np.array([len(c) > 0 for c in children_map])
+    names_arr = metadata['name'].values
+    levels_arr = metadata['level'].values
+    order_index = metadata['order'].values
+    root_order = int(metadata.loc[metadata['level'] == 0, 'order'].iloc[0])
+    max_level_global = int(metadata['level'].max())
+
+    sample_dir = os.path.join(out_dir, 'per_sample')
+    os.makedirs(sample_dir, exist_ok=True)
+
+    all_counts = pd.concat([counts_df, combined_counts_df], ignore_index=True)
+    all_direct = pd.concat([direct_counts_df, combined_direct_counts_df], ignore_index=True)
+    all_totals = pd.concat([totals_df, combined_totals_df], ignore_index=True)
+
+    readme = pd.DataFrame({
+        'column': ['LevelX_Name', 'LevelX_Count', f"'{LOST_LABEL}' row", 'Summary.lost_at_level',
+                   'Summary.cumulative_lost', 'Summary.pct_cumulative_lost'],
+        'description': [
+            "Region name at ontology depth X along this row's root-to-region path",
+            'Hierarchical rollup count at that region: cells directly in it + all its descendants '
+            '(same convention as region_stats_by_level.xlsx). Sibling counts at a level always sum to '
+            "their parent's count.",
+            'Synthetic row: cells that registered to the parent region directly above but were never '
+            'resolved to any of its finer (deeper-level) subregions -- registration stopped early for '
+            'these cells.',
+            'Total cells (this class, this sample) whose registration stopped exactly at this ontology '
+            f"level (a '{LOST_LABEL}' entry one level below their true region).",
+            'Running total of lost_at_level from level 0 through this level -- how many cells will never '
+            'appear in any region-level comparison finer than this.',
+            "cumulative_lost as a percentage of this class's total valid (non-background) cell count.",
+        ],
+    })
+
+    sample_keys = all_counts[['group', 'sample']].drop_duplicates().itertuples(index=False)
+    for group, sample in sample_keys:
+        sub_counts = all_counts[(all_counts['group'] == group) & (all_counts['sample'] == sample)]
+        sub_direct = all_direct[(all_direct['group'] == group) & (all_direct['sample'] == sample)]
+        totals = (all_totals[(all_totals['group'] == group) & (all_totals['sample'] == sample)]
+                  .set_index('class_name')['total_valid'])
+
+        summary_rows = []
+        tree_frames = {}
+        for cls, g in sub_counts.groupby('class_name'):
+            rollup = g.set_index('order')['count'].reindex(order_index).fillna(0.0).values
+            d_g = sub_direct[sub_direct['class_name'] == cls]
+            direct = (d_g.set_index('order')['direct_count'].reindex(order_index).fillna(0.0).values
+                      if not d_g.empty else np.zeros(len(order_index)))
+
+            rows = build_tree_rows(rollup, direct, children_map, names_arr, levels_arr, root_order)
+            tree_frames[cls] = tree_rows_to_frame(rows)
+
+            total_valid = totals.get(cls, 0)
+            lost_by_level = pd.Series(direct * has_children).groupby(levels_arr).sum()
+            cumulative = 0.0
+            for lvl in range(max_level_global + 1):
+                lost = float(lost_by_level.get(lvl, 0.0))
+                cumulative += lost
+                summary_rows.append({
+                    'class_name': cls, 'level': lvl, 'lost_at_level': lost,
+                    'cumulative_lost': cumulative, 'total_valid': total_valid,
+                    'pct_cumulative_lost': (cumulative / total_valid * 100.0) if total_valid else np.nan,
+                })
+
+        out_path = os.path.join(sample_dir, f'{sample}_region_registration_tree.xlsx')
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            readme.to_excel(writer, sheet_name='ReadMe', index=False)
+
+            summary_df = pd.DataFrame(summary_rows)
+            if not summary_df.empty:
+                summary_df.to_excel(writer, sheet_name='Summary', index=False)
+
+            for cls, frame in tree_frames.items():
+                if frame.empty:
+                    continue
+                frame.to_excel(writer, sheet_name=_safe_sheet_name(cls), index=False)
+        print(f"Wrote per-sample region tree: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True, help='Path to YAML config file')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    (df, group_a_name, group_b_name, counts_df, totals_df, volumes, per_sample_volumes, metadata,
-     combined_counts_df, combined_totals_df, formula_info) = run_all_stats(cfg)
+    (df, group_a_name, group_b_name, counts_df, direct_counts_df, totals_df, volumes, per_sample_volumes, metadata,
+     combined_counts_df, combined_direct_counts_df, combined_totals_df, formula_info) = run_all_stats(cfg)
     write_outputs(df, cfg, group_a_name, group_b_name)
 
     out_dir = cfg.get('output', {}).get('dir', './stats_output')
     write_per_sample_tables(counts_df, totals_df, volumes, per_sample_volumes, metadata,
                              combined_counts_df, combined_totals_df, formula_info, out_dir)
+    write_per_sample_tree_workbooks(counts_df, direct_counts_df, combined_counts_df, combined_direct_counts_df,
+                                     totals_df, combined_totals_df, metadata, out_dir)
 
 
 if __name__ == '__main__':

@@ -53,7 +53,8 @@ import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as ap
 #alignment
 import ClearMap.Alignment.Annotation as ano     
 import ClearMap.Alignment.Resampling as res
-import ClearMap.Alignment.Elastix as elx       
+import ClearMap.Alignment.Elastix as elx
+import ClearMap.Alignment.BrainMask as bmask
 import ClearMap.Alignment.Stitching.StitchingRigid as st
 import ClearMap.Alignment.Stitching.StitchingWobbly as stw
 
@@ -85,7 +86,7 @@ import ClearMap.ImageProcessing.Experts.Cells as cells
 __all__ = ['sys', 'os', 'glob', 'np', 'plt', 'reload',
            'settings', 'io', 'wsp', 'tfs', 
            'p3d', 'col', 'te', 'tmr',  'bp', 'ap',
-           'ano', 'res', 'elx', 'st', 'stw',
+           'ano', 'res', 'elx', 'bmask', 'st', 'stw',
            'clp', 'rnk', 'se', 'dif', 'skl', 'skp', 'vf',
            'grp', 'gp', 'me', 'mr', 'vox',
            'vasc', 'cells'];

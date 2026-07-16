@@ -10,7 +10,8 @@ import re
 # UI 相关 (新增了 QFileDialog 和 QMessageBox)
 from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame,
                              QCheckBox, QStackedWidget, QLineEdit, QPushButton, QDoubleSpinBox,
-                             QFileDialog, QMessageBox, QGroupBox)
+                             QFileDialog, QMessageBox, QGroupBox, QListWidget, QListWidgetItem,
+                             QAbstractItemView)
 from PyQt5.QtCore import Qt
 # Matplotlib 相关
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
@@ -230,6 +231,31 @@ class DataLoader:
         return matches[0] if matches else None
 
     @staticmethod
+    def _read_centroids_csv(csv_path):
+        """Read a cell_centroids/ob_<class>.csv file, tolerating both the
+        newer run_inference.py header format (cx,cy,z,score,slice_name,
+        tile_name -- see brain_detector/scripts/run_inference.py) and older
+        header-less x,y,z-only files. Always returns a DataFrame with at
+        least cx/cy/z columns; missing score/slice_name/tile_name are filled
+        with NaN so callers don't need to special-case legacy files."""
+        expected = ['cx', 'cy', 'z', 'score', 'slice_name', 'tile_name']
+        df = pd.read_csv(csv_path)
+        cols = [str(c).strip().lower() for c in df.columns]
+        if cols[:3] not in (['cx', 'cy', 'z'], ['x', 'y', 'z']):
+            # First row wasn't actually a header -- re-read raw and name
+            # columns positionally.
+            df = pd.read_csv(csv_path, header=None)
+            df.columns = expected[:df.shape[1]]
+        else:
+            df.columns = cols
+            if df.columns[0] == 'x':
+                df = df.rename(columns={'x': 'cx', 'y': 'cy'})
+        for col in ('score', 'slice_name', 'tile_name'):
+            if col not in df.columns:
+                df[col] = np.nan
+        return df
+
+    @staticmethod
     def load_mhd(path):
         if not os.path.exists(path): return None
         return sitk.GetArrayFromImage(sitk.ReadImage(path)).astype(np.uint32)
@@ -243,7 +269,7 @@ class DataLoader:
         return ((img_clipped - low) / (high - low) * 255).astype(np.uint8), img.shape
 
     @staticmethod
-    def load_cells_native_df(folder_path, raw_res, target_res, mhd_data, ontology, class_names):
+    def load_cells_native_df(folder_path, raw_res, target_res, mhd_data, ontology, class_names, sample_name=None):
         all_dfs = []
         scale_factor = raw_res / target_res
         mhd_shape = mhd_data.shape if mhd_data is not None else (0,0,0)
@@ -252,10 +278,11 @@ class DataLoader:
             fname = DataLoader.resolve_class_file(folder_path, class_name, CONFIG['cell_prefix'])
             csv_path = os.path.join(folder_path, fname) if fname else None
             if csv_path and os.path.exists(csv_path):
-                df = pd.read_csv(csv_path, header=None)
-                if len(df) == 0: continue
-                napari_pts = (df.values * scale_factor)[:, [2, 1, 0]] 
-                
+                df_src = DataLoader._read_centroids_csv(csv_path)
+                if len(df_src) == 0: continue
+                raw_xyz = df_src[['cx', 'cy', 'z']].values.astype(float)
+                napari_pts = (raw_xyz * scale_factor)[:, [2, 1, 0]]
+
                 ids = []
                 for p in napari_pts:
                     z, y, x = int(round(p[0])), int(round(p[1])), int(round(p[2]))
@@ -268,24 +295,39 @@ class DataLoader:
                 df_clean['class_name'] = class_name
                 df_clean['mapped_id'] = ids
                 df_clean['region'] = [ontology.get_name(uid) for uid in ids]
+                df_clean['sample'] = sample_name
+                # Provenance back to the raw TB-scale tile/slice this detection
+                # came from (see brain_detector/scripts/run_inference.py) --
+                # lets the user pull up the exact source tile for a cell they
+                # flag as suspicious in the viewer.
+                df_clean['raw_x'] = raw_xyz[:, 0]
+                df_clean['raw_y'] = raw_xyz[:, 1]
+                df_clean['raw_z'] = raw_xyz[:, 2]
+                df_clean['score'] = df_src['score'].values
+                df_clean['slice_name'] = df_src['slice_name'].values
+                df_clean['tile_name'] = df_src['tile_name'].values
                 all_dfs.append(df_clean)
         return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
     @staticmethod
-    def load_cells_atlas_df(folder_path, ontology, class_names):
+    def load_cells_atlas_df(folder_path, ontology, class_names, sample_name=None, raw_centroids_dir=None):
         all_dfs = []
         for class_name in class_names:
             actual_dir = DataLoader.resolve_class_dir(folder_path, class_name)
             csv_path = os.path.join(folder_path, actual_dir, 'cell_registration.csv') if actual_dir else None
             if csv_path and os.path.exists(csv_path):
                 try:
-                    # cell_registration.csv columns (no header): x,y,z, xr,yr,zr
-                    # (resampled-space, pre-elastix), xt,yt,zt (atlas-space,
-                    # post-elastix), graph_order, name.
+                    # cell_registration.csv columns (no header): x,y,z (raw
+                    # pixel-space centroid, cellMap.py's untransformed input),
+                    # xr,yr,zr (resampled-space, pre-elastix), xt,yt,zt
+                    # (atlas-space, post-elastix), graph_order, name, and --
+                    # for files written by the current cellMap.py --
+                    # slice_name (11), tile_name (12), score (13).
                     df_raw = pd.read_csv(csv_path, header=None, names=range(20), engine='python')
                     if len(df_raw) > 0:
                         coords = df_raw.iloc[:, 6:9].values.astype(float)
                         valid_mask = ~np.isnan(coords).any(axis=1)
+                        row_idx = np.where(valid_mask)[0]
                         coords = coords[valid_mask]
 
                         ids = df_raw.iloc[:, 9].values[valid_mask]  # graph_order, not raw atlas id
@@ -297,6 +339,49 @@ class DataLoader:
                         df_clean['class_name'] = class_name
                         df_clean['mapped_id'] = ids
                         df_clean['region'] = [ontology.get_name_by_graph_order(uid) for uid in ids]
+                        df_clean['sample'] = sample_name
+
+                        # x,y,z (cols 0-2) are always cellMap.py's raw
+                        # pixel-space input coordinates -- no join needed to
+                        # recover these.
+                        raw_xyz = df_raw.iloc[:, 0:3].values.astype(float)[valid_mask]
+                        df_clean['raw_x'] = raw_xyz[:, 0]
+                        df_clean['raw_y'] = raw_xyz[:, 1]
+                        df_clean['raw_z'] = raw_xyz[:, 2]
+
+                        # Tile/slice/score: prefer the columns the current
+                        # cellMap.py embeds directly (no cell_centroids/
+                        # dependency). Older registration files predate this
+                        # and fall back to a row-index join -- cellMap.py
+                        # processes points strictly in-order without
+                        # reordering or dropping rows, so row i here == row i
+                        # in the matching cell_centroids/ob_<class>.csv.
+                        has_embedded = df_raw.shape[1] > 12 and df_raw.iloc[:, 12].notna().any()
+                        if has_embedded:
+                            df_clean['slice_name'] = df_raw.iloc[:, 11].values[valid_mask]
+                            df_clean['tile_name'] = df_raw.iloc[:, 12].values[valid_mask]
+                            df_clean['score'] = (pd.to_numeric(df_raw.iloc[:, 13], errors='coerce').values[valid_mask]
+                                                  if df_raw.shape[1] > 13 else np.nan)
+                        else:
+                            df_clean['slice_name'] = np.nan
+                            df_clean['tile_name'] = np.nan
+                            df_clean['score'] = np.nan
+                            fname = (DataLoader.resolve_class_file(raw_centroids_dir, class_name, CONFIG['cell_prefix'])
+                                      if raw_centroids_dir else None)
+                            if fname:
+                                try:
+                                    df_src = DataLoader._read_centroids_csv(os.path.join(raw_centroids_dir, fname))
+                                    if len(df_src) == len(df_raw):
+                                        joined = df_src.iloc[row_idx].reset_index(drop=True)
+                                        df_clean['score'] = joined['score'].values
+                                        df_clean['slice_name'] = joined['slice_name'].values
+                                        df_clean['tile_name'] = joined['tile_name'].values
+                                    else:
+                                        print(f"⚠️ '{class_name}' 行数不匹配 (registration={len(df_raw)} vs "
+                                              f"centroids={len(df_src)})，跳过 tile/slice 关联。")
+                                except Exception as e:
+                                    print(f"⚠️ '{class_name}' tile/slice 关联失败: {e}")
+
                         all_dfs.append(df_clean)
                 except Exception as e:
                     print(f"❌ 解析 '{class_name}' 坐标出错: {e}")
@@ -352,6 +437,13 @@ class MainController:
         self.cell_checkboxes = {}
         self.last_search_mode = "Exact"
 
+        # 🚩 Flagging: click a cell -> pin it -> export tile/slice provenance
+        # for suspicious cells so the user can pull up the raw TB-scale tile.
+        self.flagged_cells = []       # list[dict], persists across samples/views
+        self.last_clicked_cell = None # dict, most recent cell click (candidate to pin)
+        self.flag_layer = None        # current napari points layer showing pins for this view
+        self.last_highlighted_df = pd.DataFrame()  # last Search Regions result, for bulk export
+
         self.setup_ui()
         self.setup_callbacks()
 
@@ -387,7 +479,20 @@ class MainController:
                     coords, name=f"Cell: {cls_name}", face_color=colors,
                     symbol='disc', size=self.spin_point_size.value(), border_width=0, blending='translucent', visible=is_vis
                 )
-                layer.features = pd.DataFrame({'Region': sub_df['region'].values})
+                # Carried through for click-to-pin export (tile/slice
+                # provenance -- see DataLoader.load_cells_native_df /
+                # load_cells_atlas_df).
+                layer.features = pd.DataFrame({
+                    'Region': sub_df['region'].values,
+                    'Class': sub_df['class_name'].values,
+                    'Sample': sub_df['sample'].values,
+                    'Tile': sub_df['tile_name'].values,
+                    'Slice': sub_df['slice_name'].values,
+                    'Score': sub_df['score'].values,
+                    'RawX': sub_df['raw_x'].values,
+                    'RawY': sub_df['raw_y'].values,
+                    'RawZ': sub_df['raw_z'].values,
+                })
                 layer.events.highlight.connect(self.on_cell_layer_click)
 
     def perform_search(self, search_mode=None):
@@ -396,10 +501,11 @@ class MainController:
         search_mode = self.last_search_mode
 
         keyword = self.input_search.text().strip()
-        
+        self.last_highlighted_df = pd.DataFrame()
+
         if not keyword:
             if self.highlight_cells: self.highlight_cells.data = np.empty((0, 3))
-            if self.highlight_atlas and self.current_atlas_labels is not None: 
+            if self.highlight_atlas and self.current_atlas_labels is not None:
                 self.highlight_atlas.data = np.zeros_like(self.current_atlas_labels)
             self.viewer.status = "Ready."
             return
@@ -433,8 +539,9 @@ class MainController:
             class_mask = self.current_cells_df['class_name'].isin(active_classes)
             subset_df = self.current_cells_df[region_mask & class_mask]
             subset_points = subset_df[['z', 'y', 'x']].values
-            
+
             self.highlight_cells.data = subset_points if len(subset_points) > 0 else np.empty((0, 3))
+            self.last_highlighted_df = subset_df.copy()
             self.viewer.status = f"✅ [{search_mode}] Found {len(matched_ids)} regions | Cells: {len(subset_points)}"
 
     def load_standard_view(self):
@@ -467,9 +574,10 @@ class MainController:
             labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.05, visible=False)
             self.setup_highlight_layers(mhd.shape)
 
-        df_cells = DataLoader.load_cells_native_df(s['cell_dir_raw'], CONFIG['res_original'], CONFIG['res_resampled'], mhd, self.ontology, self.classes)
+        df_cells = DataLoader.load_cells_native_df(s['cell_dir_raw'], CONFIG['res_original'], CONFIG['res_resampled'], mhd, self.ontology, self.classes, sample_key)
         self.current_cells_df = df_cells
         self.render_cells_from_df(df_cells, labels_layer)
+        self.setup_flag_layer(sample_key)
 
     def load_sample_atlas_view(self, sample_key):
         self.viewer.layers.clear()
@@ -486,9 +594,10 @@ class MainController:
             atlas_layer = self.viewer.add_labels(self.current_atlas_labels, name="Atlas Anatomy", opacity=0.3)
             self.setup_highlight_layers(self.current_atlas_labels.shape)
         
-        df_cells = DataLoader.load_cells_atlas_df(s['cell_dir_reg'], self.ontology, self.classes)
+        df_cells = DataLoader.load_cells_atlas_df(s['cell_dir_reg'], self.ontology, self.classes, sample_key, s['cell_dir_raw'])
         self.current_cells_df = df_cells
         self.render_cells_from_df(df_cells, atlas_layer)
+        self.setup_flag_layer(sample_key)
 
     def on_cell_layer_click(self, event):
         layer = event.source
@@ -498,7 +607,105 @@ class MainController:
             full_name = layer.features['Region'].iloc[idx]
             self.input_search.setText(full_name)
             self.perform_search("Exact")
-            layer.selected_data = set() 
+
+            pt = layer.data[idx]
+            self.last_clicked_cell = {
+                'sample': layer.features['Sample'].iloc[idx],
+                'mode': self.mode,
+                'class_name': layer.features['Class'].iloc[idx],
+                'region': full_name,
+                'z': float(pt[0]), 'y': float(pt[1]), 'x': float(pt[2]),
+                'raw_x': layer.features['RawX'].iloc[idx],
+                'raw_y': layer.features['RawY'].iloc[idx],
+                'raw_z': layer.features['RawZ'].iloc[idx],
+                'score': layer.features['Score'].iloc[idx],
+                'slice_name': layer.features['Slice'].iloc[idx],
+                'tile_name': layer.features['Tile'].iloc[idx],
+            }
+            self.lbl_last_click.setText(self._format_last_click(self.last_clicked_cell))
+
+            layer.selected_data = set()
+
+    # --- 🚩 Flagging: pin suspicious cells, export tile/slice provenance ---
+    @staticmethod
+    def _fmt(v, nd=1):
+        try:
+            if v is None or (isinstance(v, float) and np.isnan(v)): return '—'
+            if isinstance(v, (int, float, np.floating, np.integer)): return f"{float(v):.{nd}f}"
+            return str(v)
+        except Exception:
+            return '—'
+
+    def _format_last_click(self, c):
+        return (f"Region: {c['region']}  |  Class: {c['class_name']}\n"
+                f"Tile: {self._fmt(c.get('tile_name'), 0)}   Slice: {self._fmt(c.get('slice_name'), 0)}\n"
+                f"Raw XYZ: ({self._fmt(c.get('raw_x'))}, {self._fmt(c.get('raw_y'))}, {self._fmt(c.get('raw_z'))})"
+                f"   Score: {self._fmt(c.get('score'), 3)}")
+
+    def setup_flag_layer(self, sample_key):
+        """(Re)create the '🚩 Flagged Cells' points layer for the current
+        sample+mode, restoring any previously-pinned points so flags survive
+        switching between samples/views (self.flagged_cells is the durable
+        store; this layer is just its visual projection onto the current
+        view's coordinate space)."""
+        if "🚩 Flagged Cells" in self.viewer.layers:
+            self.viewer.layers.remove("🚩 Flagged Cells")
+        matches = [f for f in self.flagged_cells if f['sample'] == sample_key and f['mode'] == self.mode]
+        pts = np.array([[f['z'], f['y'], f['x']] for f in matches]) if matches else np.empty((0, 3))
+        self.flag_layer = self.viewer.add_points(
+            pts, ndim=3, name="🚩 Flagged Cells", symbol='star',
+            face_color='red', border_color='yellow', border_width=0.1,
+            size=self.spin_point_size.value() * 2.2, opacity=0.95
+        )
+
+    def pin_last_clicked_cell(self):
+        if not self.last_clicked_cell:
+            QMessageBox.information(None, "Info", "还没有点击过任何细胞。请先在视图中点击一个细胞点，再点 Pin。")
+            return
+        entry = dict(self.last_clicked_cell)
+        entry['pinned_at'] = pd.Timestamp.now().isoformat(timespec='seconds')
+        self.flagged_cells.append(entry)
+        if self.flag_layer is not None:
+            pt = np.array([[entry['z'], entry['y'], entry['x']]])
+            self.flag_layer.data = np.vstack([self.flag_layer.data, pt]) if len(self.flag_layer.data) else pt
+        self.lbl_flag_count.setText(f"🚩 已标记 {len(self.flagged_cells)} 个细胞")
+
+    def export_flagged_cells(self):
+        if not self.flagged_cells:
+            QMessageBox.information(None, "Info", "还没有标记任何细胞。")
+            return
+        path, _ = QFileDialog.getSaveFileName(None, "Export Flagged Cells", "flagged_cells.csv", "CSV Files (*.csv)")
+        if not path: return
+        cols = ['sample', 'mode', 'class_name', 'region', 'tile_name', 'slice_name',
+                'raw_x', 'raw_y', 'raw_z', 'z', 'y', 'x', 'score', 'pinned_at']
+        pd.DataFrame(self.flagged_cells)[cols].to_csv(path, index=False)
+        QMessageBox.information(None, "Exported", f"已导出 {len(self.flagged_cells)} 个标记细胞 → {path}")
+
+    def clear_flagged_cells(self):
+        if not self.flagged_cells: return
+        reply = QMessageBox.question(None, "Confirm", f"确定清空全部 {len(self.flagged_cells)} 个标记吗？此操作不可撤销。",
+                                      QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes: return
+        self.flagged_cells = []
+        if self.flag_layer is not None:
+            self.flag_layer.data = np.empty((0, 3))
+        self.lbl_flag_count.setText("🚩 已标记 0 个细胞")
+
+    def export_highlighted_cells(self):
+        """Bulk export every cell currently matched by Search Regions --
+        for when an entire anomalous region/cluster needs its source
+        tiles/slices pulled, not just one outlier cell."""
+        df = self.last_highlighted_df
+        if df is None or df.empty:
+            QMessageBox.information(None, "Info", "当前没有高亮的细胞可导出。请先用 Search Regions 搜索一个脑区。")
+            return
+        path, _ = QFileDialog.getSaveFileName(None, "Export Highlighted Cells", "highlighted_cells.csv", "CSV Files (*.csv)")
+        if not path: return
+        cols = ['sample', 'class_name', 'region', 'mapped_id', 'tile_name', 'slice_name',
+                'raw_x', 'raw_y', 'raw_z', 'z', 'y', 'x', 'score']
+        cols = [c for c in cols if c in df.columns]
+        df[cols].to_csv(path, index=False)
+        QMessageBox.information(None, "Exported", f"已导出 {len(df)} 个细胞 → {path}")
 
     def refresh_heatmaps(self):
         if self.mode != "Stats" or self.current_atlas_labels is None: return
@@ -653,12 +860,36 @@ class MainController:
         btn_exact.clicked.connect(lambda: self.perform_search("Exact"))
         h_search_btns.addWidget(btn_fuzzy); h_search_btns.addWidget(btn_exact)
         layout.addLayout(h_search_btns)
-        
+
+        btn_export_highlight = QPushButton("📤 Export Highlighted Cells (tile/slice)")
+        btn_export_highlight.clicked.connect(self.export_highlighted_cells)
+        layout.addWidget(btn_export_highlight)
+
         self.lbl_hover = QLabel("📍 Hover: None")
         self.lbl_hover.setStyleSheet("color: #888; font-size: 11px;")
         self.lbl_hover.setWordWrap(True); self.lbl_hover.setFixedHeight(20)
         self.lbl_hover.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         layout.addWidget(self.lbl_hover)
+
+        layout.addSpacing(5); line_flag = QFrame(); line_flag.setFrameShape(QFrame.HLine); layout.addWidget(line_flag); layout.addSpacing(5)
+
+        layout.addWidget(QLabel("<b>🚩 Flag Suspicious Cell:</b> click a cell point, then Pin"))
+        self.lbl_last_click = QLabel("尚未点击任何细胞")
+        self.lbl_last_click.setStyleSheet("color: #888; font-size: 11px;")
+        self.lbl_last_click.setWordWrap(True)
+        layout.addWidget(self.lbl_last_click)
+
+        h_flag_btns = QHBoxLayout()
+        btn_pin = QPushButton("📌 Pin"); btn_export_flags = QPushButton("💾 Export"); btn_clear_flags = QPushButton("🗑 Clear")
+        btn_pin.clicked.connect(self.pin_last_clicked_cell)
+        btn_export_flags.clicked.connect(self.export_flagged_cells)
+        btn_clear_flags.clicked.connect(self.clear_flagged_cells)
+        h_flag_btns.addWidget(btn_pin); h_flag_btns.addWidget(btn_export_flags); h_flag_btns.addWidget(btn_clear_flags)
+        layout.addLayout(h_flag_btns)
+
+        self.lbl_flag_count = QLabel("🚩 已标记 0 个细胞")
+        self.lbl_flag_count.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.lbl_flag_count)
 
         layout.addSpacing(5); line2 = QFrame(); line2.setFrameShape(QFrame.HLine); layout.addWidget(line2); layout.addSpacing(5)
 
@@ -667,10 +898,16 @@ class MainController:
 
         # Stats mode: single class selector, populated dynamically once the
         # cell classes (marker combinations) are discovered from the data.
+        # A checkable list (instead of a dropdown) keeps ~5 classes visible
+        # at once with no extra click to open a menu; checking an entry
+        # unchecks the rest so selection stays single, like the old combo.
         page_stats = QWidget(); layout_stats = QVBoxLayout(page_stats); layout_stats.setContentsMargins(0,0,0,0)
-        self.combo_class_single = QComboBox()
-        self.combo_class_single.currentTextChanged.connect(self.on_class_single_change)
-        layout_stats.addWidget(self.combo_class_single)
+        self.list_class_single = QListWidget()
+        self.list_class_single.setSelectionMode(QAbstractItemView.NoSelection)
+        row_height = self.list_class_single.fontMetrics().height() + 10
+        self.list_class_single.setFixedHeight(row_height * 5 + 2 * self.list_class_single.frameWidth())
+        self.list_class_single.itemChanged.connect(self.on_class_single_item_changed)
+        layout_stats.addWidget(self.list_class_single)
         self.class_stack.addWidget(page_stats)
 
         # Sample view mode: one checkbox per discovered cell class (no
@@ -777,12 +1014,16 @@ class MainController:
         pseudo-classes (e.g. 'glia', 'gfp' from stats_group_compare.py's
         merged_classes config) are summed at analysis time and have no
         matching cell_registration/ folder of their own."""
-        self.combo_class_single.blockSignals(True)
-        self.combo_class_single.clear()
+        self.list_class_single.blockSignals(True)
+        self.list_class_single.clear()
         stats_classes = set(self.all_stats_df['class_name'].unique()) if not self.all_stats_df.empty else set()
         combined = sorted(set(self.classes) | stats_classes)
-        self.combo_class_single.addItems(combined)
-        self.combo_class_single.blockSignals(False)
+        for i, name in enumerate(combined):
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if i == 0 else Qt.Unchecked)
+            self.list_class_single.addItem(item)
+        self.list_class_single.blockSignals(False)
         self.current_class = combined[0] if combined else None
 
     def _rebuild_level_combo(self):
@@ -804,6 +1045,8 @@ class MainController:
         for layer in self.viewer.layers:
             if layer.name.startswith("Cell:") or layer.name == ">> Highlight Cells <<":
                 layer.size = val
+            elif layer.name == "🚩 Flagged Cells":
+                layer.size = val * 2.2
 
     def on_mode_change(self, text):
         if not self.ontology or "等待" in text or "未找" in text: return
@@ -824,8 +1067,21 @@ class MainController:
                 self.mode = "Atlas_Sample"
                 self.load_sample_atlas_view(sample_name)
 
-    def on_class_single_change(self, text):
-        self.current_class = text
+    def on_class_single_item_changed(self, item):
+        """Keep the stats-mode class list single-select: checking an entry
+        unchecks all others, mirroring the old combo box's behavior."""
+        self.list_class_single.blockSignals(True)
+        if item.checkState() == Qt.Checked:
+            for i in range(self.list_class_single.count()):
+                other = self.list_class_single.item(i)
+                if other is not item:
+                    other.setCheckState(Qt.Unchecked)
+            self.current_class = item.text()
+        else:
+            # Prevent unchecking the only selected item -- there must
+            # always be exactly one class selected in stats mode.
+            item.setCheckState(Qt.Checked)
+        self.list_class_single.blockSignals(False)
         self.refresh_heatmaps()
 
     def on_level_change(self, text):

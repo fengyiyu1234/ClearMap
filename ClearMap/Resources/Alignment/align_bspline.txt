@@ -1,4 +1,4 @@
-//Bspline Transformation
+//Bspline Transformation  (modified: + bending-energy regularization, ASGD optimizer)
 
 //__author__    = 'Nicolas Renier, Christoph Kirst <christoph.kirst.ck@gmail.com>'
 //__license__   = 'GPLv3 - GNU General Pulic License v3 (see LICENSE)'
@@ -13,12 +13,28 @@
 (MovingImageDimension 3)
 
 //Components
-(Registration "MultiResolutionRegistration")
+// CHANGED: MultiResolutionRegistration -> MultiMetricMultiResolutionRegistration
+// so we can combine the image metric with a smoothness penalty.
+(Registration "MultiMetricMultiResolutionRegistration")
 (FixedImagePyramid "FixedSmoothingImagePyramid")
 (MovingImagePyramid "MovingSmoothingImagePyramid")
 (Interpolator "BSplineInterpolator")
-(Metric "AdvancedMattesMutualInformation")
-(Optimizer "StandardGradientDescent")
+
+// CHANGED: added TransformBendingEnergyPenalty as a second metric.
+// This is the regularization that was missing and let the field fold.
+(Metric "AdvancedMattesMutualInformation" "TransformBendingEnergyPenalty")
+(Metric0Weight 1.0)
+// CHANGED: 1.0 -> 1000. Logged Metric1 (bending energy) values are ~1e-4,
+// vs Metric0 (MI) ~0.1-0.3 — a ~1000-3000x gap. At weight 1.0 the penalty
+// was numerically inert (contributed nothing to the optimized total), so
+// the field was never actually regularized. Raise further (5000, 10000) if
+// the field still folds; lower if the deformation looks over-rigid.
+(Metric1Weight 1000)
+
+// CHANGED: StandardGradientDescent (fixed huge step) -> ASGD (auto step size)
+(Optimizer "AdaptiveStochasticGradientDescent")
+(AutomaticParameterEstimation "true")
+
 (ResampleInterpolator "FinalBSplineInterpolator")
 (Resampler "DefaultResampler")
 (Transform "BSplineTransform")
@@ -34,14 +50,20 @@
 (WriteResultImage "true")
 (CompressResultImage "false")
 (WriteResultImageAfterEachResolution "false")
-(ShowExactMetricValue "false")
+// CHANGED: "false" -> "true". With RandomCoordinate sampling the per-
+// iteration "Final metric value" in the log is just one noisy stochastic
+// sample, not comparable across runs. This makes elastix compute the real
+// full-image metric at the end of each resolution instead.
+(ShowExactMetricValue "true")
 (WriteDiffusionFiles "true")
 
 // Option supported in elastix 4.1:
 (UseFastAndLowMemoryVersion "true")
 
 //Maximum number of iterations in each resolution level:
-(MaximumNumberOfIterations 5000 ) 
+// CHANGED: 5000 -> 2000. With ASGD you no longer need to burn 5000 steps;
+// convergence should be visible well before this.
+(MaximumNumberOfIterations 2000 )
 
 //Number of grey level bins in each resolution level:
 (NumberOfHistogramBins 128 )
@@ -53,12 +75,17 @@
 //Number of spatial samples used to compute the mutual information in each resolution level:
 (ImageSampler "RandomCoordinate")
 (FixedImageBSplineInterpolationOrder 1 )
-(UseRandomSampleRegion "true")
-(SampleRegionSize 50.0 50.0 50.0)
-(NumberOfSpatialSamples 10000 )
+// CHANGED: "true" -> "false" (and removed the now-unused SampleRegionSize).
+// UseRandomSampleRegion=true was silently disabling ASGD's
+// UseAdaptiveStepSizes (elastix logs this warning explicitly), which
+// defeated part of the point of switching to ASGD in the first place.
+(UseRandomSampleRegion "false")
+// CHANGED: 10000 -> 3000 per iteration is fine for ASGD; you can go back up
+// if gradients look noisy. (More samples = slower but smoother gradient.)
+(NumberOfSpatialSamples 3000 )
 (NewSamplesEveryIteration "true")
 (CheckNumberOfSamples "true")
-(MaximumNumberOfSamplingAttempts 10)
+(MaximumNumberOfSamplingAttempts 8)
 
 //Order of B-Spline interpolation used in each resolution level:
 (BSplineInterpolationOrder 3)
@@ -69,12 +96,6 @@
 //Default pixel value for pixels that come from outside the picture:
 (DefaultPixelValue 0)
 
-//SP: Param_a in each resolution level. a_k = a/(A+k+1)^alpha
-(SP_a 10000.0 )
-
-//SP: Param_A in each resolution level. a_k = a/(A+k+1)^alpha
-(SP_A 100.0 )
-
-//SP: Param_alpha in each resolution level. a_k = a/(A+k+1)^alpha
-(SP_alpha 0.6 )
-
+// REMOVED: manual step-size schedule (SP_a / SP_A / SP_alpha).
+// ASGD with AutomaticParameterEstimation estimates these itself; leaving them
+// in would fight the auto-estimation, which was the whole problem before.

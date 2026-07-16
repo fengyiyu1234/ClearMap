@@ -507,10 +507,11 @@ def rescale_size_and_spacing(size, spacing, scale):
 
 def align(fixed_image, moving_image, affine_parameter_file, bspline_parameter_file=None,
           result_directory=None, processes=None,
-          workspace=None, moving_landmarks_path=None, fixed_landmarks_path=None):
+          workspace=None, moving_landmarks_path=None, fixed_landmarks_path=None,
+          fixed_mask=None, moving_mask=None):
   """
   Align images using elastix, estimates a transformation :math:`T:` fixed image :math:`\\rightarrow` moving image.
-  
+
   Arguments
   ---------
   fixed_image : str
@@ -525,7 +526,13 @@ def align(fixed_image, moving_image, affine_parameter_file, bspline_parameter_fi
     Elastic result directory.
   processes : int or None
     Number of threads to use.
-      
+  fixed_mask : str or None
+    Optional path to a binary mask image restricting the metric to a region
+    of the fixed image (elastix -fMask).
+  moving_mask : str or None
+    Optional path to a binary mask image restricting the metric to a region
+    of the moving image (elastix -mMask).
+
   Returns
   -------
   result_directory : str
@@ -550,6 +557,10 @@ def align(fixed_image, moving_image, affine_parameter_file, bspline_parameter_fi
     cmd.extend(['-p', f'{bspline_parameter_file}'])
   if moving_landmarks_path is not None or fixed_landmarks_path is not None:
     cmd.extend(['-mp', f'{moving_landmarks_path}', '-fp', f'{fixed_landmarks_path}'])
+  if fixed_mask is not None:
+    cmd.extend(['-fMask', f'{fixed_mask}'])
+  if moving_mask is not None:
+    cmd.extend(['-mMask', f'{moving_mask}'])
   cmd.extend(['-out', f'{result_directory}'])
 
   try:

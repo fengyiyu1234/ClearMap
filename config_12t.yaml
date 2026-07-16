@@ -1,0 +1,47 @@
+# 路径配置
+#nohup python cellMap.py --config config_12t.yaml > /dev/null 2>&1 &
+
+paths:
+  data_dir: "/data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/s12t"
+  stitched_filename: "registration.npy" #convert .tif to .npy if the file is too large
+  # If true, auto-convert a same-named .tif in data_dir (e.g. registration.tif)
+  # to .npy on first run, and reuse the existing .npy on later runs.
+  convert_tif_to_npy: true
+
+# 分辨率配置 (单位: um)
+resolution:
+  original: [0.65, 0.65, 8] #resolution of detection results, usually the same as the original image
+  stitched: [2.6, 2.6, 32.0]  #resolution of the stitched image (
+                              #third resolusion (2) downsampled 4x: [2.6, 2.6, 32.0]
+                              #fourth resolusion (3) downsampled 8x: [5.2, 5.2, 64.0]
+                              #fifth resolusion (4) downsampled 16x: [10.4, 10.4, 128.0]
+  resampled: [20.0, 20.0, 20.0] #resolution of p5 atlas, no need to change as long as you are using p5 atlas
+
+# 配准参数
+registration:
+  # change the orientation of atlas to match the orientation of the stitched image, the slicing should also be changed accordingly
+  # direction of atlas: 
+    # the start point of the coordinate system is the bottom right corner of the atlas
+    # 1 axis is from right to left, 2 axis is from top to bottom, 3 axis is from back to front
+    # default orientation: [1, 2, 3], shape [570, 400, 563], coronal slicing
+  orientation: [1, 3, 2] 
+
+  slicing:
+    - [285, 510]
+    - null
+    - null
+
+  # Crop resampled image to brain region before registration (voxels @ 20um).
+  # Fill in after inspecting resampled.tif in ImageJ. Leave null to use full image.
+  crop_for_registration:
+    x: null   # e.g. [10, 680]
+    y: null   # e.g. [150, 850]
+    z:  [20,null] # [45, 498] 
+
+# 细胞分类配置
+cells:
+  prefix: "ob_"
+  # Whether to also write a full atlas-resolution density counts .tif per cell
+  # class (used for group-level statistics maps). Set false to skip — these
+  # files can be very large.
+  save_density_tif: false

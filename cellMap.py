@@ -5,7 +5,9 @@ Organized for clarity and maintainability.
 """
 #make sure input points are in pixel coordinates of the stitched image
 #if spatial coordinate, transform_points(indices=False)
-# nohup python cellMap.py &> /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC/s12q/log.txt
+# The script logs to <data_dir>/log.txt on its own (see "Logging" below), so
+# an explicit &> redirect is no longer needed:
+# nohup python cellMap.py --config config_12t.yaml &
 import os
 # Headless servers have no X11 display, but ClearMap.Environment pulls in
 # Qt-based plotting modules on import (unused here); force the offscreen
@@ -14,22 +16,68 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import csv
 import shutil
 import numpy as np
+import pandas as pd
 import tifffile
 from ClearMap.Environment import *
 import numpy.lib.recfunctions as rfn
 import glob
 import yaml
 import sys
+import argparse
 
 # ==== 1. 加载配置文件 ====
-def load_config(config_path='/home/fyu7/My_project/COMBINe/ClearMap/config.yaml'):
+def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-cfg = load_config()
+def parse_args():
+    default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+    parser = argparse.ArgumentParser(description='Run the ClearMap registration + cell mapping pipeline for one sample.')
+    parser.add_argument('--config', default=default_config,
+                         help=f'Path to the sample config YAML (default: {default_config})')
+    # argparse chokes on stray args from e.g. `python -m ipykernel ...`; ignore unknowns.
+    args, _ = parser.parse_known_args()
+    return args
+
+cfg = load_config(parse_args().config)
 
 # ==== 2. 映射参数 ====
 DATA_DIR = cfg['paths']['data_dir']
+
+# ==== ==== Logging ==== ====
+# Mirror stdout/stderr into <data_dir>/log.txt, so the log always lands next
+# to the sample it belongs to (no need to remember/type the full data_dir
+# path in a shell redirect every time). Appends, so re-runs on the same
+# sample accumulate history instead of clobbering the previous log.
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+    def fileno(self):
+        # subprocess.Popen(stdout=sys.stdout, ...) (used by Elastix.align()
+        # to run the elastix binary) needs a real OS file descriptor, which
+        # a pure-Python object can't provide for both streams at once.
+        # Delegate to the first stream (the real terminal/nohup stdout) so
+        # the elastix subprocess keeps working; its own output is still
+        # fully captured in <result_directory>/elastix.log regardless, so
+        # nothing is lost — it's just not duplicated into our log.txt too.
+        return self.streams[0].fileno()
+
+LOG_PATH = os.path.join(DATA_DIR, 'log.txt')
+_log_file = open(LOG_PATH, 'a')
+print(f"\n{'='*30}\nRun started: {pd.Timestamp.now()}\n{'='*30}", file=_log_file, flush=True)
+sys.stdout = _Tee(sys.stdout, _log_file)
+sys.stderr = _Tee(sys.stderr, _log_file)
+print(f"Logging to {LOG_PATH}")
 
 def ensure_stitched_npy(stitched_filename):
     """If enabled in config, convert stitched .tif -> .npy since ClearMap
@@ -191,12 +239,20 @@ def crop_resampled_for_registration():
 #check result.mhd in ws.filename('auto_to_reference') folder
 def align_to_reference(): # Align resampled image to reference, save transform params
     fixed_image = crop_resampled_for_registration()
+
+    # Brain mask for the fixed (sample) image, so the MI metric isn't
+    # diluted by background — matters most for small/misshapen samples.
+    # Generated on the exact image passed as -f, so shapes always match.
+    fixed_mask_path = os.path.join(DATA_DIR, 'resampled_mask.tif')
+    bmask.generate_brain_mask(fixed_image, sink_path=fixed_mask_path)
+
     align_reference_parameter = {
         "moving_image": reference_file, #moving the reference to the sample
         "fixed_image": fixed_image,
         "affine_parameter_file": align_reference_affine_file,
         "bspline_parameter_file": align_reference_bspline_file,
-        "result_directory": ws.filename('auto_to_reference')
+        "result_directory": ws.filename('auto_to_reference'),
+        "fixed_mask": fixed_mask_path,
     }
     elx.align(**align_reference_parameter)
 
@@ -230,6 +286,29 @@ def insertdir(parent_file, i, name='cell_registration'):
         os.makedirs(dir_inserted)
     return os.path.join(dir_inserted, os.path.basename(parent_file))
 
+def _read_centroid_csv(csv_path):
+    """Read a cell_centroids/ob_<class>.csv file, tolerating both the
+    run_inference.py header format (cx,cy,z,score,slice_name,tile_name --
+    see brain_detector/scripts/run_inference.py) and older header-less
+    x,y,z-only files. Always returns a DataFrame with cx/cy/z plus
+    score/slice_name/tile_name (NaN-filled if absent from the source)."""
+    expected = ['cx', 'cy', 'z', 'score', 'slice_name', 'tile_name']
+    df = pd.read_csv(csv_path)
+    cols = [str(c).strip().lower() for c in df.columns]
+    if cols[:3] not in (['cx', 'cy', 'z'], ['x', 'y', 'z']):
+        # First row wasn't actually a header -- re-read raw and name
+        # columns positionally.
+        df = pd.read_csv(csv_path, header=None)
+        df.columns = expected[:df.shape[1]]
+    else:
+        df.columns = cols
+        if df.columns[0] == 'x':
+            df = df.rename(columns={'x': 'cx', 'y': 'cy'})
+    for col in ('score', 'slice_name', 'tile_name'):
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
 def process_cell_class(class_name):
     # 1. Load points for this class
     cell_points_file = os.path.join(CELL_CENTROIDS_DIR, f'{CELL_PREFIX}{class_name}.csv')
@@ -238,18 +317,24 @@ def process_cell_class(class_name):
         return
 
     try:
-        points = np.loadtxt(cell_points_file, delimiter=',', skiprows=1, usecols=(0, 1, 2))
-        
-        if points.ndim == 1:
-            points = points.reshape(1, -1)
-            
-    except StopIteration:
-        # 应对完全为空的 CSV 文件
-        points = np.array([])
-    
-    if len(points) == 0:
+        df_src = _read_centroid_csv(cell_points_file)
+    except Exception as e:
+        # 应对完全为空 / 损坏的 CSV 文件
+        print(f"Skipping class {class_name}: failed to read CSV ({e}).")
+        return
+
+    if len(df_src) == 0:
         print(f"Skipping class {class_name}: 0 cells found in csv.")
         return
+
+    # np.ascontiguousarray: DataFrame.values can hand back an F-contiguous
+    # array, which silently breaks the .view() struct trick used below to
+    # write cells_data -- np.loadtxt (the old reader) never had this problem
+    # since it always returns C-contiguous arrays.
+    points = np.ascontiguousarray(df_src[['cx', 'cy', 'z']].values, dtype=float)
+    slice_names = df_src['slice_name'].fillna('').astype(str).values
+    tile_names = df_src['tile_name'].fillna('').astype(str).values
+    scores = pd.to_numeric(df_src['score'], errors='coerce').fillna(0.0).values.astype(float)
 
     # 2. Transform coordinates
     coordinates = points / ratio
@@ -318,19 +403,42 @@ def process_cell_class(class_name):
     # points.dtype = [(c, float) for c in ('x', 'y', 'z')]
     # coordinates_resampled.dtype = [(c, float) for c in ('xr', 'yr', 'zr')]
     # coordinates_transformed.dtype = [(t, float) for t in ('xt', 'yt', 'zt')]
-    points = points.view([(c, float) for c in ('x', 'y', 'z')])
-    coordinates_resampled = coordinates_resampled.view([(c, float) for c in ('xr', 'yr', 'zr')])
-    coordinates_transformed = coordinates_transformed.view([(t, float) for t in ('xt', 'yt', 'zt')])
+    points = np.ascontiguousarray(points).view([(c, float) for c in ('x', 'y', 'z')])
+    coordinates_resampled = np.ascontiguousarray(coordinates_resampled).view([(c, float) for c in ('xr', 'yr', 'zr')])
+    coordinates_transformed = np.ascontiguousarray(coordinates_transformed).view([(t, float) for t in ('xt', 'yt', 'zt')])
 
     label_struct = np.array(label_values, dtype=[('graph_order', int)])
     names_struct = np.array(name_values, dtype=[('name', 'S256')])
+    # Tile/slice/score provenance from the source cell_centroids file (see
+    # brain_detector/scripts/run_inference.py) -- carried straight through so
+    # a cell flagged as suspicious in the viewer can be traced back to its
+    # source TB-scale tile without depending on cell_centroids/ still
+    # existing alongside this registration output. Column order matters:
+    # stats_img_vis_ui.py's load_cells_atlas_df reads these positionally at
+    # indices 11 (slice_name), 12 (tile_name), 13 (score).
+    slice_struct = np.array(slice_names, dtype=[('slice_name', 'S256')])
+    tile_struct = np.array(tile_names, dtype=[('tile_name', 'S256')])
+    score_struct = np.array(scores, dtype=[('score', float)])
 
-    cells_data = rfn.merge_arrays([points, coordinates_resampled, coordinates_transformed, label_struct, names_struct], flatten=True, usemask=False)
-    
+    cells_data = rfn.merge_arrays(
+        [points, coordinates_resampled, coordinates_transformed, label_struct, names_struct,
+         slice_struct, tile_struct, score_struct],
+        flatten=True, usemask=False
+    )
+
     io.write(insertdir(ws.filename('cell_registration'), class_name), cells_data)
-    np.savetxt(
-        insertdir(ws.filename('cell_registration', extension='csv'), class_name), 
-        cells_data, delimiter=',', fmt='%s'
+
+    # CSV written via pandas (not np.savetxt) so slice_name/tile_name save as
+    # plain text instead of numpy's b'...' bytes-repr for string fields --
+    # this file is meant to be opened directly to trace a cell back to its
+    # source tile/slice. Kept header-less (as before) for backward
+    # compatibility with stats_img_vis_ui.py's positional CSV reader.
+    csv_df = pd.DataFrame(cells_data)
+    for col in ('name', 'slice_name', 'tile_name'):
+        csv_df[col] = csv_df[col].apply(lambda v: v.decode('utf-8', errors='replace') if isinstance(v, bytes) else v)
+    csv_df.to_csv(
+        insertdir(ws.filename('cell_registration', extension='csv'), class_name),
+        index=False, header=False
     )
 
 print(f"Loading annotation volume from: {annotation_file}")
