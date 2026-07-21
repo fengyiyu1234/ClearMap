@@ -168,3 +168,48 @@ the above fixes in place hasn't happened yet. Next time: re-run
 error is gone now that the mask is solid; if it recurs, switch
 `align_affine.txt`'s `ImageSampler` to `"RandomSparseMask"` and set
 `ErodeMask` to `"false"`.
+
+---
+
+## 2026-07-17
+
+**Problem:** First full end-to-end run with the convex-hull fixed mask
+completed successfully (`s12t`, `elastix_auto_to_reference/` dated
+2026-07-16 17:47-17:50, `-fMask resampled_mask.tif`, coverage 23.4%, no
+`-mMask`). User inspected the result and judged registration *worse* than
+before the mask was added.
+
+**Analysis:** Affine `TransformParameters.0.txt` diagonal is now
+`[1.065, 0.995, 0.966]` (near-identity) vs. the pre-mask/pre-crop baseline's
+`[1.47, 0.92, 1.25]` (see [[p5_registration_shape_mismatch]]). Not yet
+determined whether this is a genuine improvement (background no longer
+inflating the fixed image's apparent size/scale) or a regression (MI is only
+evaluated inside the eroded fixed mask — `ErodeMask "true"`, the
+`align_affine.txt` default — so the optimizer has no signal from tissue near
+the mask boundary and may undershoot the true scale, especially since only
+`-fMask` is set and no `-mMask`). Elastix log shows no errors, just the
+expected "consider `RandomSparseMask`" advisory (unchanged from before).
+Haven't yet visually compared `result.1` (bspline output, atlas warped onto
+sample grid) against `resampled_cropped.tif` slice-by-slice to pin down
+*where* it looks wrong (periphery vs. interior, one axis vs. all, one
+region vs. global).
+
+**Changes:**
+- `cellMap.py`: added `USE_BRAIN_MASK = cfg['registration'].get('use_brain_mask', True)`
+  and made `align_to_reference()` skip mask generation + `-fMask` when false
+  (defaults to `true`, so other samples'/configs' behavior is unchanged).
+- `config_12t.yaml`: added `registration.use_brain_mask: false` to re-test
+  `s12t` without the fixed mask.
+
+**Result:** (pending re-run)
+
+**Next:**
+1. Re-run `cellMap.py --config config_12t.yaml` with `use_brain_mask: false`
+   and compare visually against the 2026-07-16 masked run.
+2. If no-mask is clearly better, the mask (or `ErodeMask`/erosion behavior,
+   or the missing `-mMask`) is the regression — try `ErodeMask "false"` or
+   adding a loose `-mMask` (atlas already trimmed, so a permissive mask
+   should be low-risk) before reverting the mask entirely.
+3. If no-mask looks the same or worse, the near-identity affine is likely
+   the more accurate one and the visual "worse" impression needs a second
+   look (e.g. compare specific structures/slices, not just overall gestalt).

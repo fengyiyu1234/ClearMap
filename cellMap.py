@@ -132,7 +132,8 @@ def parse_slicing(slicing_list):
 MY_SLICING = parse_slicing(cfg['registration']['slicing'])
 MY_ORIENTATION = tuple(cfg['registration']['orientation'])
 CROP_CONFIG = cfg['registration'].get('crop_for_registration', None)
-CROP_OFFSET = np.array([0, 0, 0], dtype=float)  
+CROP_OFFSET = np.array([0, 0, 0], dtype=float)
+USE_BRAIN_MASK = cfg['registration'].get('use_brain_mask', True)
 
 # ==== ==== Workspace Setup ==== ====
 ws = wsp.Workspace('CellMap', directory=DATA_DIR)
@@ -243,8 +244,13 @@ def align_to_reference(): # Align resampled image to reference, save transform p
     # Brain mask for the fixed (sample) image, so the MI metric isn't
     # diluted by background — matters most for small/misshapen samples.
     # Generated on the exact image passed as -f, so shapes always match.
-    fixed_mask_path = os.path.join(DATA_DIR, 'resampled_mask.tif')
-    bmask.generate_brain_mask(fixed_image, sink_path=fixed_mask_path)
+    # Toggle via config.yaml's registration.use_brain_mask (default true).
+    fixed_mask_path = None
+    if USE_BRAIN_MASK:
+        fixed_mask_path = os.path.join(DATA_DIR, 'resampled_mask.tif')
+        bmask.generate_brain_mask(fixed_image, sink_path=fixed_mask_path)
+    else:
+        print("use_brain_mask=false — registering without a fixed mask.")
 
     align_reference_parameter = {
         "moving_image": reference_file, #moving the reference to the sample

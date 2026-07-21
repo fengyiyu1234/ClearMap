@@ -4,6 +4,7 @@ import numpy as np
 import tifffile
 import SimpleITK as sitk
 import os
+import glob
 import json
 import re
 
@@ -111,14 +112,42 @@ class DataLoader:
         return pts
 
     @staticmethod
-    def load_mhd(path):
-        if not os.path.exists(path): return None
-        return sitk.GetArrayFromImage(sitk.ReadImage(path)).astype(np.uint32)
+    def load_volume(path, dtype=None):
+        """Read a 3D volume regardless of format: .tif/.tiff via tifffile,
+        everything else (.nii/.nii.gz/.mhd/.mha/.nrrd) via SimpleITK -- ANTs
+        writes standard NIfTI, and sitk reads it through the same ITK IO
+        layer it already uses for ClearMap's .mhd files, so no special
+        handling is needed per format beyond picking the reader."""
+        if not path or not os.path.exists(path): return None
+        if path.lower().endswith(('.tif', '.tiff')):
+            arr = tifffile.imread(path)
+        else:
+            arr = sitk.GetArrayFromImage(sitk.ReadImage(path))
+        return arr.astype(dtype) if dtype is not None else arr
+
+    @staticmethod
+    def resolve_native_paths(target_dir):
+        """Find the raw sample image + atlas-labels-warped-to-sample-space
+        file, whichever pipeline produced them:
+          ClearMap: resampled.tif + volume/result.mhd
+          ANTs:     <name>_fine_*um.nii.gz + <name>_labels_in_sample.nii.gz
+        Returns (img_path, labels_path), either may be None if not found.
+        """
+        cm_img = os.path.join(target_dir, 'resampled.tif')
+        cm_labels = os.path.join(target_dir, 'volume', 'result.mhd')
+        if os.path.exists(cm_img) or os.path.exists(cm_labels):
+            return (cm_img if os.path.exists(cm_img) else None,
+                    cm_labels if os.path.exists(cm_labels) else None)
+
+        fine_matches = glob.glob(os.path.join(target_dir, '*_fine_*um.nii.gz'))
+        labels_matches = glob.glob(os.path.join(target_dir, '*_labels_in_sample.nii.gz'))
+        return (fine_matches[0] if fine_matches else None,
+                labels_matches[0] if labels_matches else None)
 
     @staticmethod
     def normalize_image_8bit(img_path):
-        if not os.path.exists(img_path): return None, None
-        img = tifffile.imread(img_path)
+        img = DataLoader.load_volume(img_path)
+        if img is None: return None, None
         low, high = np.percentile(img, [0.5, 95.5])
         img_clipped = np.clip(img, low, high)
         return ((img_clipped - low) / (high - low) * 255).astype(np.uint8), img.shape
@@ -353,12 +382,11 @@ class MainController:
         self.current_cells_df = pd.DataFrame()
         print(f"\n🚀 Loading Native View from: {self.target_dir}")
         
-        resampled_path = os.path.join(self.target_dir, 'resampled.tif')
-        mhd_path = os.path.join(self.target_dir, 'volume', 'result.mhd')
+        resampled_path, mhd_path = DataLoader.resolve_native_paths(self.target_dir)
         cell_reg_dir = os.path.join(self.target_dir, 'cell_registration')
 
         img_norm, shape = DataLoader.normalize_image_8bit(resampled_path)
-        mhd = DataLoader.load_mhd(mhd_path)
+        mhd = DataLoader.load_volume(mhd_path, dtype=np.uint32)
         # 使用 cell_registration.csv 中已经算好的 resample 空间坐标 (第4-6列, 0-indexed 3:6)
         df_cells = DataLoader.load_cells_from_registration(cell_reg_dir, self.ontology, coord_start=3)
 
@@ -375,7 +403,7 @@ class MainController:
         if img_norm is not None:
             self.viewer.add_image(img_norm, name="Raw Image", colormap="gray", blending='additive')
         else:
-            print(f"⚠️ 找不到 {resampled_path}")
+            print(f"⚠️ 找不到样本图像 (resampled.tif 或 *_fine_*um.nii.gz)，目录: {self.target_dir}")
 
         labels_layer = None
         if mhd is not None:
@@ -383,7 +411,7 @@ class MainController:
             labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.05, visible=False)
             self.setup_highlight_layers(mhd.shape)
         else:
-            print(f"⚠️ 找不到 {mhd_path}，无法为细胞赋予准确的脑区颜色和筛选。")
+            print(f"⚠️ 找不到样本空间标签图 (volume/result.mhd 或 *_labels_in_sample.nii.gz)，无法为细胞赋予准确的脑区颜色和筛选。")
 
         self.current_cells_df = df_cells
         self.update_class_filter_ui(df_cells)
@@ -403,9 +431,19 @@ class MainController:
         df_cells = DataLoader.load_cells_from_registration(cell_reg_dir, self.ontology, coord_start=6)
 
         k = CONFIG.get('view_rotate_k', 0)
+
+        # ANTs pipeline 额外产出了"样本变形到图谱空间"的灰度图 (<name>_in_atlas.nii.gz)，
+        # 跟 Atlas Anatomy 标签图是同一个网格，直接叠加显示，方便肉眼核对配准准不准。
+        # ClearMap 原生流程没有这个文件，找不到就跳过，不影响原有功能。
+        in_atlas_matches = glob.glob(os.path.join(self.target_dir, '*_in_atlas.nii.gz'))
+        if in_atlas_matches:
+            img_norm, _ = DataLoader.normalize_image_8bit(in_atlas_matches[0])
+            if img_norm is not None:
+                if k: img_norm = DataLoader.rotate_vol(img_norm, k)
+                self.viewer.add_image(img_norm, name="Sample in Atlas", colormap="gray", blending='additive')
+
         if os.path.exists(atlas_path):
-            data = tifffile.imread(atlas_path) if atlas_path.lower().endswith(('.tif', '.tiff')) else __import__('nrrd').read(atlas_path)[0]
-            data = data.astype(np.uint32)
+            data = DataLoader.load_volume(atlas_path, dtype=np.uint32)
             if k:
                 orig_shape = data.shape
                 data = DataLoader.rotate_vol(data, k)
